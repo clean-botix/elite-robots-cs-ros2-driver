@@ -217,11 +217,18 @@
       <xacro:build_inertial mass="${wrist_3_mass}" cog="${prop_wrist_3_cog}" inertia="${prop_wrist_3_inertia}"/>
     </link>
 
-     <!-- base_joint fixes base_link to the environment -->
-    <joint name="${tf_prefix}base_joint" type="fixed">
-      <xacro:insert_block name="origin" />
+    <link name="fts_link" />
+    <joint name="fts_link_joint" type="fixed">
       <parent link="${parent}" />
+      <child link="fts_link" />
+      <origin xyz="0.0 0 0.0" rpy="3.14 0 3.14" />
+    </joint> 
+    
+    <!-- base_joint fixes base_link to the environment -->
+    <joint name="${tf_prefix}base_joint" type="fixed">
+      <parent link="fts_link" />
       <child link="${tf_prefix}base_link" />
+      <origin xyz="0.0 0 0.0" rpy="-3.14 0 -3.14" />
     </joint>
 
     <!-- joints - main serial chain -->

@@ -41,6 +41,7 @@ def launch_setup(context, *args, **kwargs):
     reverse_port = LaunchConfiguration("reverse_port")
     script_sender_port = LaunchConfiguration("script_sender_port")
     trajectory_port = LaunchConfiguration("trajectory_port")
+    parent = LaunchConfiguration("parent")
     custom_xacro_path = LaunchConfiguration("custom_xacro_path")
 
     joint_limit_params = PathJoinSubstitution(
@@ -163,6 +164,9 @@ def launch_setup(context, *args, **kwargs):
             " ",
             "trajectory_port:=",
             trajectory_port,
+            " ",
+            "parent:=",
+            parent,
             " ",
         ]
     )
@@ -530,6 +534,13 @@ def generate_launch_description():
             "trajectory_port",
             default_value="50003",
             description="Port that will be opened for trajectory control.",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "parent",
+            default_value="world",
+            description="Link that the arm is attached to.",
         )
     )
     declared_arguments.append(
