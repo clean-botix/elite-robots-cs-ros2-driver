@@ -310,7 +310,7 @@ std::vector<hardware_interface::CommandInterface> EliteCSPositionHardwareInterfa
 
 hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configure(const rclcpp_lifecycle::State& previous_state) {
     (void)previous_state;
-    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Starting ...please wait...");
+    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Starting... please wait...");
 
     // The robot's IP address.
     const std::string robot_ip = info_.hardware_parameters["robot_ip"];
@@ -362,18 +362,20 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
     auto start_time = std::chrono::steady_clock::now();
 
     try {
-        eli_driver_ = std::make_unique<ELITE::EliteDriver>(
-            robot_ip,
-            local_ip,
-            script_filename,
-            headless_mode,
-            script_sender_port,
-            reverse_port,
-            trajectory_port,
-            script_command_port,
-            servoj_time,
-            servoj_lookahead_time,
-            servoj_gain);
+        ELITE::EliteDriverConfig driver_config;
+        driver_config.robot_ip = robot_ip;
+        driver_config.local_ip = local_ip;
+        driver_config.script_file_path = script_filename;
+        driver_config.headless_mode = headless_mode;
+        driver_config.script_sender_port = script_sender_port;
+        driver_config.reverse_port = reverse_port;
+        driver_config.trajectory_port = trajectory_port;
+        driver_config.script_command_port = script_command_port;
+        driver_config.servoj_time = servoj_time;
+        driver_config.servoj_lookahead_time = servoj_lookahead_time;
+        driver_config.servoj_gain = servoj_gain;
+
+        eli_driver_ = std::make_unique<ELITE::EliteDriver>(driver_config);
 
         bool connected = false;
         while (!connected) {
@@ -387,7 +389,7 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
             rclcpp::sleep_for(std::chrono::seconds(2));
         }
 
-        rtsi_ = std::make_unique<ELITE::RtsiIOInterface>(output_recipe_filename, input_recipe_filename, 250);
+        rtsi_interface_ = std::make_unique<ELITE::RtsiClientInterface>();
 
         connected = false;
         while (!connected) {
@@ -396,12 +398,16 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
                     "connection timeout after " + std::to_string(robot_connect_timeout) + " seconds");
             }
 
-            connected = rtsi_->connect(robot_ip);
+            connected = rtsi_interface_->connect(robot_ip);
             // Node sleep before retry
             rclcpp::sleep_for(std::chrono::seconds(2));
         }
     } catch (ELITE::EliteException& e) {
         RCLCPP_FATAL_STREAM(rclcpp::get_logger("EliteCSPositionHardwareInterface"), e.what());
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+
+    if (!rtsiInit(output_recipe_filename, input_recipe_filename)) {
         return hardware_interface::CallbackReturn::ERROR;
     }
 
@@ -468,11 +474,7 @@ std::vector<std::string> EliteCSPositionHardwareInterface::readRecipe(const std:
     return recipe;
 }
 
-bool EliteCSPositionHardwareInterface::rtsiInit(const std::string& ip, const std::string& output_file,
-                                                const std::string& input_file) {
-    rtsi_interface_ = std::make_unique<ELITE::RtsiClientInterface>();
-    rtsi_interface_->connect(ip);
-
+bool EliteCSPositionHardwareInterface::rtsiInit(const std::string& output_file, const std::string& input_file) {
     if (!rtsi_interface_->negotiateProtocolVersion()) {
         RCLCPP_FATAL(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "RTSI check protocol version: 'fail'.");
         return false;
@@ -488,6 +490,7 @@ bool EliteCSPositionHardwareInterface::rtsiInit(const std::string& ip, const std
         RCLCPP_FATAL(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "RTSI start data sync: 'fail'.");
         return false;
     }
+
     return true;
 }
 

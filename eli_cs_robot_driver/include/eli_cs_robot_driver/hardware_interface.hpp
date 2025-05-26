@@ -169,7 +169,7 @@ protected:
 
     void extractToolPose();
     void transformForceTorque();
-    bool rtsiInit(const std::string& ip, const std::string& output_file, const std::string& input_file);
+    bool rtsiInit(const std::string& output_file, const std::string& input_file);
     std::vector<std::string> readRecipe(const std::string& recipe_file);
 
     template <const char*... Args>
