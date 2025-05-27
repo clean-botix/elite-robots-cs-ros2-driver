@@ -12,6 +12,9 @@ controller_manager:
     joint_trajectory_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
+    servo_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
     forward_velocity_controller:
       type: velocity_controllers/JointGroupVelocityController
     
