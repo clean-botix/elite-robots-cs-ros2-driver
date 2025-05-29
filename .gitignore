@@ -2,3 +2,6 @@
 install/**
 build/**
 log/**
+
+# macOS junk
+.DS_Store
