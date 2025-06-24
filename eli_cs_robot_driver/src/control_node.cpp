@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
         std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds> next_iteration_time{cm_now};
 
         RCLCPP_INFO(controller_manager->get_logger(),
-            "Period: %lu \t Update Rate: %lu", period, controller_manager->get_update_rate());
+            "Period (ns): %lu Update Rate: %lu (Hz)", period, controller_manager->get_update_rate());
 
         // for calculating the measured period of the loop
         rclcpp::Time previous_time = controller_manager->now();
