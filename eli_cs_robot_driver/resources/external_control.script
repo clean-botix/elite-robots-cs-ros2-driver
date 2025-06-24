@@ -230,6 +230,8 @@ read_timeout = 0.0 # First read is blocking
 violation_popup_counter = 0
 
 while control_mode > MODE_STOPPED:
+    # First byte of response is return value of the read itself.
+    # This offsets the byte indexing by 1 from what the driver sends.
     params_mult = socket_read_binary_integer(REVERSE_DATA_SIZE, "reverse_socket", read_timeout)
     if params_mult[0] > 0:
         # Convert to read timeout from milliseconds to seconds
