@@ -52,16 +52,19 @@
     tool_stop_bits:=1
     tool_tcp_port:=54321
     robot_ip:=0.0.0.0
+    local_ip:=0.0.0.0
     robot_connect_timeout:=10
+    robot_receive_timeout:=0.2
+    servoj_gain=:=1000
+    servoj_lookahead_time:=0.32
+    servoj_time:=0.008
     script_filename:=to_be_filled_by_cs_robot_driver
     output_recipe_filename:=to_be_filled_by_cs_robot_driver
     input_recipe_filename:=to_be_filled_by_cs_robot_driver
     reverse_port:=50001
     script_sender_port:=50002
-    local_ip:=0.0.0.0
     script_command_port:=50004
     trajectory_port:=50003"
-
     >
 
     <!-- Load configuration data from the provided .yaml files -->
@@ -90,7 +93,12 @@
         input_recipe_filename="${input_recipe_filename}"
         tf_prefix="${tf_prefix}"
         robot_ip="${robot_ip}"
+        local_ip="${local_ip}"
         robot_connect_timeout="${robot_connect_timeout}"
+        robot_receive_timeout="${robot_receive_timeout}"
+        servoj_gain="${servoj_gain}"
+        servoj_lookahead_time="${servoj_lookahead_time}"
+        servoj_time="${servoj_time}"
         use_tool_communication="${use_tool_communication}"
         tool_voltage="${tool_voltage}"
         tool_parity="${tool_parity}"
@@ -99,7 +107,6 @@
         tool_tcp_port="${tool_tcp_port}"
         reverse_port="${reverse_port}"
         script_sender_port="${script_sender_port}"
-        local_ip="${local_ip}"
         script_command_port="${script_command_port}"
         trajectory_port="${trajectory_port}"
         />

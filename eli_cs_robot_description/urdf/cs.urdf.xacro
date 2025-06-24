@@ -22,12 +22,16 @@
    <xacro:arg name="safety_k_position" default="20"/>
    <!-- ros2_control related parameters -->
    <xacro:arg name="headless_mode" default="false" />
-   <xacro:arg name="robot_connect_timeout" default="10" />   
    <xacro:arg name="robot_ip" default="0.0.0.0" />
+   <xacro:arg name="local_ip" default="0.0.0.0"/>
+   <xacro:arg name="robot_connect_timeout" default="10" />   
+   <xacro:arg name="robot_receive_timeout" default="0.2" />
+   <xacro:arg name="servoj_gain" default="1000" />
+   <xacro:arg name="servoj_lookahead_time" default="0.32" />
+   <xacro:arg name="servoj_time" default="0.008" />
    <xacro:arg name="script_filename" default=""/>
    <xacro:arg name="output_recipe_filename" default=""/>
    <xacro:arg name="input_recipe_filename" default=""/>
-   <xacro:arg name="local_ip" default="0.0.0.0"/>
    <xacro:arg name="script_command_port" default="50004"/>
    <xacro:arg name="reverse_port" default="50001"/>
    <xacro:arg name="script_sender_port" default="50002"/>
@@ -87,11 +91,15 @@
      tool_stop_bits="$(arg tool_stop_bits)"
      tool_tcp_port="$(arg tool_tcp_port)"
      robot_ip="$(arg robot_ip)"
+     local_ip="$(arg local_ip)"
      robot_connect_timeout="$(arg robot_connect_timeout)"
+     robot_receive_timeout="$(arg robot_receive_timeout)"
+     servoj_gain="$(arg servoj_gain)"
+     servoj_lookahead_time="$(arg servoj_lookahead_time)"
+     servoj_time="$(arg servoj_time)"
      script_filename="$(arg script_filename)"
      output_recipe_filename="$(arg output_recipe_filename)"
      input_recipe_filename="$(arg input_recipe_filename)"
-     local_ip="$(arg local_ip)"
      script_command_port="$(arg script_command_port)"
      reverse_port="$(arg reverse_port)"
      script_sender_port="$(arg script_sender_port)"
