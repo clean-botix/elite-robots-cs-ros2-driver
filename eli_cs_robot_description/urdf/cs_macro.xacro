@@ -64,8 +64,8 @@
     reverse_port:=50001
     script_sender_port:=50002
     script_command_port:=50004
-    trajectory_port:=50003"
-    >
+    trajectory_port:=50003
+    ">
 
     <!-- Load configuration data from the provided .yaml files -->
     <xacro:read_model_data
