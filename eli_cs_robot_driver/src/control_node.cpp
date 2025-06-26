@@ -4,7 +4,7 @@
 
 #include <controller_manager/controller_manager.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <realtime_tools/thread_priority.hpp>
+#include <realtime_tools/realtime_helpers.hpp>
 
 // code is inspired by
 // https://github.com/ros-controls/ros2_control/blob/master/controller_manager/src/ros2_control_node.cpp
@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
         std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds> next_iteration_time{cm_now};
 
         RCLCPP_INFO(controller_manager->get_logger(),
-            "Period (ns): %u Update Rate: %u (Hz)", period, controller_manager->get_update_rate());
+            "Period (ns): %lu Update Rate: %u (Hz)", period.count(), controller_manager->get_update_rate());
 
         // for calculating the measured period of the loop
         rclcpp::Time previous_time = controller_manager->now();
