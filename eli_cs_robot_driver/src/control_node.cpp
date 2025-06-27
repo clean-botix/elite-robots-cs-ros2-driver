@@ -4,9 +4,13 @@
 
 #include <controller_manager/controller_manager.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <realtime_tools/realtime_helpers.hpp>
 
-// code is inspired by
+// This include directive triggers a compilation warning to use <realtime_tools/realtime_helpers.hpp> instead.
+// However, while that change is a drop-in replacement that clears the warning, something about it introduces
+// a breaking change of the worse kind -- silent failures. Arm motions fail in real life without explicit errors, etc.
+#include <realtime_tools/thread_priority.hpp>
+
+// Elite code is inspired by:
 // https://github.com/ros-controls/ros2_control/blob/master/controller_manager/src/ros2_control_node.cpp
 
 std::atomic<int> exit_code{0};
