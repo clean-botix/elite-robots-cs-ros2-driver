@@ -57,7 +57,6 @@ global cmd_speed_joint
 global steptime
 global trajectory_point_num
 global cmd_servo_joints
-global violation_popup_counter
 
 def trajectoryThread():
     global trajectory_point_num
@@ -189,7 +188,6 @@ script_command_thread_handle = start_thread(scriptCommands, ())
 move_thread_handle = 0
 trajectory_thread_handle = 0
 read_timeout = 0.0 # First read is blocking
-violation_popup_counter = 0
 
 while control_mode > MODE_STOPPED:
     # First byte of response is return value of the read itself.
