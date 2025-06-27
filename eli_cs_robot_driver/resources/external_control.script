@@ -150,12 +150,15 @@ def scriptCommands():
                 cog = [raw_command[3] / COMMON_ZOOM_RATIO, raw_command[4] / COMMON_ZOOM_RATIO, raw_command[5] / COMMON_ZOOM_RATIO]
                 # Ensure message bytes evaluate to valid payload
                 if mass > 0.0 and mass <= 14.4:
+                    textmsg("Set payload mass: ", mass)
+                    textmsg("Set payload CoG: ", cog)
                     set_payload(mass, cog)
             elif command == SCRIPT_CMD_SET_TOOL_VOLTAGE:
                 tool_voltage = raw_command[2] / COMMON_ZOOM_RATIO
                 tool_voltage = int(tool_voltage)
                 # Ensure message bytes evaluate to valid voltage setting
                 if tool_voltage > 0:
+                    textmsg("Set tool voltage: ", tool_voltage)
                     set_tool_voltage(tool_voltage)
             elif command == SCRIPT_CMD_START_FORCE_MODE:
                 task_frame = [raw_command[2] / COMMON_ZOOM_RATIO, raw_command[3] / COMMON_ZOOM_RATIO, raw_command[4] / COMMON_ZOOM_RATIO, raw_command[5] / COMMON_ZOOM_RATIO, raw_command[6] / COMMON_ZOOM_RATIO, raw_command[7] / COMMON_ZOOM_RATIO]
