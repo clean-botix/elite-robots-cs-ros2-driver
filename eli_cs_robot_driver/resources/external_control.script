@@ -149,7 +149,7 @@ def scriptCommands():
                 mass = raw_command[2] / COMMON_ZOOM_RATIO
                 cog = [raw_command[3] / COMMON_ZOOM_RATIO, raw_command[4] / COMMON_ZOOM_RATIO, raw_command[5] / COMMON_ZOOM_RATIO]
                 # Ensure message bytes evaluate to valid payload
-                if mass > 0:
+                if mass > 0.0 and mass <= 14.4:
                     set_payload(mass, cog)
             elif command == SCRIPT_CMD_SET_TOOL_VOLTAGE:
                 tool_voltage = raw_command[2] / COMMON_ZOOM_RATIO
