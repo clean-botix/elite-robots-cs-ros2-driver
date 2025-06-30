@@ -1,0 +1,38 @@
+name: Sync Dependencies In MoveIt Pro Workspace Repo
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - feature/moveit_pro
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-deps:
+    uses: getdevopspro/github-actions/.github/workflows/pr-create.yml@v0.2.19
+    secrets:
+      token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+      ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+    with:
+      repository: ${{ github.repository_owner }}/OptimusClean-MoveItProWorkspace
+      ref: main
+      lfs: true
+      just-install: true
+      command: just deps-sync
+      branch: create-pull-request/sync-deps
+      committer: cleanlogix-cibot <193524276+cleanlogix-cibot@users.noreply.github.com>
+      author: cleanlogix-cibot <193524276+cleanlogix-cibot@users.noreply.github.com>
+      commit-message: |-
+        ci: sync external dependencies
+
+        From repo '${{ github.repository }}' in workflow '${{ github.workflow }}'
+      title: Sync external dependencies from ${{ github.repository }}
+      body: This PR was automatically generated to keep dependencies up to date. It was created by the workflow `${{ github.workflow }}` in the repository `${{ github.repository }}`.
