@@ -1,7 +1,6 @@
-name: Sync Dependencies In MoveIt Pro Workspace Repo
+name: MoveIt Pro Workspace - Trigger Dependency Sync
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - feature/moveit_pro
@@ -26,7 +25,7 @@ jobs:
       lfs: true
       just-install: true
       command: just deps-sync
-      branch: create-pull-request/sync-deps
+      branch: create-pull-request/sync-deps-from-elite-driver-repo
       committer: cleanlogix-cibot <193524276+cleanlogix-cibot@users.noreply.github.com>
       author: cleanlogix-cibot <193524276+cleanlogix-cibot@users.noreply.github.com>
       commit-message: |-
