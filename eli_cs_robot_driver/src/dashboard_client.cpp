@@ -20,10 +20,8 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
 
     power_on_service_ = createTriggerService("~/power_on", [&]() -> bool { return client_.powerOn(); });
     power_off_service_ = createTriggerService("~/power_off", [&]() -> bool { return client_.powerOff(); });
-//    remote_control_on_service_ = createTriggerService("~/remote_control_on", [&]() -> bool { return client_.remoteControlOn(); });
-//    remote_control_off_service_ = createTriggerService("~/remote_control_off", [&]() -> bool { return client_.remoteControlOff(); });
-    remote_control_on_service_ = createTriggerService("~/remote_control_on", [&]() -> bool { return client_.powerOn(); });
-    remote_control_off_service_ = createTriggerService("~/remote_control_off", [&]() -> bool { return client_.powerOff(); });
+    remote_control_on_service_ = createTriggerService("~/remote_control_on", [&]() -> bool { return client_.remoteControlOn(); });
+    remote_control_off_service_ = createTriggerService("~/remote_control_off", [&]() -> bool { return client_.remoteControlOff(); });
     play_service_ = createTriggerService("~/play", [&]() -> bool { return client_.playProgram(); });
     pause_service_ = createTriggerService("~/pause", [&]() -> bool { return client_.pauseProgram(); });
     stop_service_ = createTriggerService("~/stop", [&]() -> bool { return client_.stopProgram(); });
