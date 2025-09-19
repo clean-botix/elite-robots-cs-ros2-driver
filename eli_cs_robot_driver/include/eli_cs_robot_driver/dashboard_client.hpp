@@ -22,6 +22,8 @@ class DashboardClient : public rclcpp::Node {
    private:
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr connect_service_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr power_on_service_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr remote_control_on_service_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr remote_control_off_service_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr power_off_service_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr play_service_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr pause_service_;
