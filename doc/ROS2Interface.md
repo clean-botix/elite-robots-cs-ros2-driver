@@ -52,6 +52,12 @@ Tool voltage that will be set as soon as the task on the robot is started.
 
 ### Services
 
+#### *remote_control_on*[(std_srvs/Trigger)](https://docs.ros.org/en/api/std_srvs/html/srv/Trigger.html)
+Enable remote mode necessary for most software-controlled functions.
+
+#### *remote_control_off*[(std_srvs/Trigger)](https://docs.ros.org/en/api/std_srvs/html/srv/Trigger.html)
+Disable remote mode (return to local model).
+
 #### *power_on*[(std_srvs/Trigger)](https://docs.ros.org/en/api/std_srvs/html/srv/Trigger.html)
 Power on the robot motors. To fully start the robot, call ‘brake_release’ afterwards.
 
