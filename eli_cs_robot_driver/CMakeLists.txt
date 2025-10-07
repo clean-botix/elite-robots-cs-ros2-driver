@@ -20,6 +20,8 @@ find_package(controller_manager REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
 find_package(backward_ros REQUIRED)
 find_package(elite-cs-series-sdk REQUIRED)
+find_package(data_tamer_cpp REQUIRED)
+find_package(data_tamer_msgs REQUIRED)
 
 set(
   THIS_PACKAGE_DEPENDENCIES
@@ -33,6 +35,8 @@ set(
   rclcpp 
   rclcpp_components
   controller_manager_msgs
+  data_tamer_cpp
+  data_tamer_msgs
 )
 
 # Add dashboard client component

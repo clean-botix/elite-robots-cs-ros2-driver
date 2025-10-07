@@ -3,6 +3,7 @@
 
 // System
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
@@ -23,6 +24,13 @@
 
 #include <Elite/EliteDriver.hpp>
 #include <Elite/RtsiClientInterface.hpp>
+
+// Forward declaration to avoid pulling DataTamer headers here
+namespace DataTamer {
+class LogChannel;
+class MCAPSink;
+class ROS2PublisherSink;
+}
 
 namespace ELITE_CS_ROBOT_ROS_DRIVER {
 
@@ -58,6 +66,16 @@ public:
                                                                 const std::vector<std::string>& stop_interfaces) final;
 
 protected:
+    std::shared_ptr<DataTamer::LogChannel> dt_hw_channel_;
+    std::shared_ptr<DataTamer::MCAPSink> dt_hw_mcap_sink_;
+    std::shared_ptr<rclcpp::Node> dt_ros_node_;
+    std::shared_ptr<DataTamer::ROS2PublisherSink> dt_ros_sink_;
+    bool dt_hw_registered_ = false;
+    double dt_cmd_mode_ = 0.0; // 0: idle, 1: position, 2: velocity, 3: freedrive
+    double dt_hw_timestamp_ = 0.0;
+    std::string dt_hw_mcap_base_path_;
+    std::string dt_hw_current_mode_ = "idle";
+    uint64_t dt_hw_mcap_sequence_ = 0;
     std::unique_ptr<ELITE::EliteDriver> eli_driver_;
     std::unique_ptr<ELITE::RtsiClientInterface> rtsi_interface_;
     ELITE::RtsiRecipeSharedPtr rtsi_out_recipe_;
@@ -171,6 +189,8 @@ protected:
     void transformForceTorque();
     bool rtsiInit(const std::string& output_file, const std::string& input_file);
     std::vector<std::string> readRecipe(const std::string& recipe_file);
+    std::string determineActiveControllerMode() const;
+    void rotateMcapRecording(const std::string& new_mode);
 
     template <const char*... Args>
     bool containsAnyOfString(const std::vector<std::string>& input) {

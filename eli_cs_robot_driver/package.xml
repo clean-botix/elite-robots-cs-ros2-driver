@@ -30,6 +30,8 @@
   <depend>pluginlib</depend>
   <depend>controller_manager_msgs</depend>
   <depend>controller_manager</depend>
+  <depend>data_tamer_cpp</depend>
+  <depend>data_tamer_msgs</depend>
   <depend>launch</depend>
   <depend>launch_ros</depend>
   

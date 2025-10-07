@@ -2,8 +2,10 @@
 #include <Elite/EliteException.hpp>
 #include <algorithm>
 #include <bitset>
+#include <cctype>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
@@ -12,6 +14,10 @@
 #include <utility>
 #include <vector>
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
+// DataTamer logging
+#include "data_tamer/data_tamer.hpp"
+#include "data_tamer/sinks/mcap_sink.hpp"
+#include "data_tamer/sinks/ros2_publisher_sink.hpp"
 
 namespace ELITE_CS_ROBOT_ROS_DRIVER {
 
@@ -417,6 +423,94 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
     async_thread_alive_ = true;
     async_thread_ = std::make_unique<std::thread>([&]() { asyncThread(); });
 
+    // Initialize DataTamer channel and register variables for command logging
+    try {
+        const std::string channel_name = "elite_hw_commands";
+        dt_hw_channel_ = DataTamer::ChannelsRegistry::Global().getChannel(channel_name);
+
+        // Determine sinks from hardware parameters
+        bool enable_mcap = false;
+        if (auto it_en = info_.hardware_parameters.find("data_tamer_enable_mcap"); it_en != info_.hardware_parameters.end()) {
+            enable_mcap = (it_en->second == "true" || it_en->second == "1");
+        }
+
+        // ROS sink (enabled by default)
+        bool enable_ros = true;
+        if (auto it_ros_en = info_.hardware_parameters.find("data_tamer_enable_ros"); it_ros_en != info_.hardware_parameters.end()) {
+            enable_ros = (it_ros_en->second == "true" || it_ros_en->second == "1");
+        }
+
+        std::string ros_topic_prefix = "elite_hwi_debug";
+        if (auto it2 = info_.hardware_parameters.find("data_tamer_ros_topic_prefix"); it2 != info_.hardware_parameters.end()) {
+            ros_topic_prefix = it2->second;
+        }
+        if (true) {
+            dt_ros_node_ = std::make_shared<rclcpp::Node>("elite_hw_logger");
+            auto ros_sink = std::make_shared<DataTamer::ROS2PublisherSink>(dt_ros_node_, ros_topic_prefix);
+            dt_ros_sink_ = ros_sink;
+            dt_hw_channel_->addDataSink(ros_sink);
+        } else {
+            dt_ros_sink_.reset();
+            dt_ros_node_.reset();
+        }
+
+        if (enable_mcap) {
+            std::string mcap_path = "elite_hw_commands.mcap";
+            if (auto it = info_.hardware_parameters.find("data_tamer_mcap_path"); it != info_.hardware_parameters.end()) {
+                mcap_path = it->second;
+            }
+            dt_hw_mcap_base_path_ = mcap_path;
+            dt_hw_mcap_sequence_ = 0;
+            dt_hw_current_mode_ = determineActiveControllerMode();
+            dt_hw_mcap_sink_ = std::make_shared<DataTamer::MCAPSink>(mcap_path);
+            dt_hw_mcap_sink_->setMaxTimeBeforeReset(std::chrono::seconds(0));
+            dt_hw_channel_->addDataSink(dt_hw_mcap_sink_);
+        } else {
+            dt_hw_mcap_base_path_.clear();
+            dt_hw_mcap_sequence_ = 0;
+            dt_hw_current_mode_ = determineActiveControllerMode();
+        }
+
+        // Register command variables and a mode indicator
+        dt_hw_channel_->registerValue("pos_j0_cmd", &position_commands_[0]);
+        dt_hw_channel_->registerValue("pos_j1_cmd", &position_commands_[1]);
+        dt_hw_channel_->registerValue("pos_j2_cmd", &position_commands_[2]);
+        dt_hw_channel_->registerValue("pos_j3_cmd", &position_commands_[3]);
+        dt_hw_channel_->registerValue("pos_j4_cmd", &position_commands_[4]);
+        dt_hw_channel_->registerValue("pos_j5_cmd", &position_commands_[5]);
+
+        dt_hw_channel_->registerValue("vel_j0_cmd", &velocity_commands_[0]);
+        dt_hw_channel_->registerValue("vel_j1_cmd", &velocity_commands_[1]);
+        dt_hw_channel_->registerValue("vel_j2_cmd", &velocity_commands_[2]);
+        dt_hw_channel_->registerValue("vel_j3_cmd", &velocity_commands_[3]);
+        dt_hw_channel_->registerValue("vel_j4_cmd", &velocity_commands_[4]);
+        dt_hw_channel_->registerValue("vel_j5_cmd", &velocity_commands_[5]);
+
+        dt_hw_channel_->registerValue("cmd_mode", &dt_cmd_mode_);
+        dt_hw_channel_->registerValue("timestamp", &dt_hw_timestamp_);
+
+        for (size_t idx = 0; idx < joint_positions_.size(); ++idx) {
+            dt_hw_channel_->registerValue("pos_j" + std::to_string(idx) + "_state", &joint_positions_[idx]);
+            dt_hw_channel_->registerValue("vel_j" + std::to_string(idx) + "_state", &joint_velocities_[idx]);
+            dt_hw_channel_->registerValue("eff_j" + std::to_string(idx) + "_state", &joint_efforts_[idx]);
+        }
+
+        dt_hw_channel_->registerValue("speed_scaling_state", &speed_scaling_combined_);
+
+        // Take an initial snapshot so the schema gets published immediately
+        dt_hw_timestamp_ = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        dt_hw_channel_->takeSnapshot();
+        dt_hw_registered_ = true;
+
+        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "DataTamer logging enabled. ROS: %s, MCAP: %s",
+                    enable_ros ? ros_topic_prefix.c_str() : "disabled",
+                    enable_mcap ? "enabled" : "disabled");
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "Failed to initialize DataTamer logging: %s", e.what());
+    }
+
     RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "System successfully started!");
 
     return hardware_interface::CallbackReturn::SUCCESS;
@@ -439,6 +533,19 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_cleanup(
     }
     rtsi_interface_.reset();
     eli_driver_.reset();
+
+    // Ensure MCAP file is closed properly so footer gets written
+    if (dt_hw_mcap_sink_) {
+        try {
+            dt_hw_mcap_sink_->stopRecording();
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                        "Error stopping DataTamer MCAP sink: %s", e.what());
+        }
+        dt_hw_mcap_sink_.reset();
+    }
+    dt_ros_sink_.reset();
+    dt_ros_node_.reset();
 
     RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "System successfully stopped!");
 
@@ -630,17 +737,37 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
 hardware_interface::return_type EliteCSPositionHardwareInterface::write(const rclcpp::Time& time, const rclcpp::Duration& period) {
     (void)time;
     (void)period;
+    auto record_snapshot = [&](double mode) {
+        if (!dt_hw_registered_) {
+            return;
+        }
+        dt_cmd_mode_ = mode;
+        dt_hw_timestamp_ =
+            std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        dt_hw_channel_->takeSnapshot();
+    };
     // If there is no interpreting task running on the robot, we do not want to send anything.
+    if (runtime_state_ == ELITE::TaskStatus::PLAYING) {
+        record_snapshot(100.0);  // active runtime but no motion command yet
+    } else if (is_robot_connected_) {
+        record_snapshot(10.0);  // connected but idle
+    }
     if (runtime_state_ == ELITE::TaskStatus::PLAYING && is_robot_connected_) {
         if (position_controller_running_) {
+            record_snapshot(1.0);  // position mode
+            // RCLCPP_ERROR(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "write position command: %f, %f, %f, %f, %f, %f", position_commands_[0], position_commands_[1],
+            //               position_commands_[2], position_commands_[3], position_commands_[4], position_commands_[5]);
             eli_driver_->writeServoj(position_commands_, recv_timeout_ * 1000);
 
         } else if (velocity_controller_running_) {
+            record_snapshot(2.0);  // velocity mode
             eli_driver_->writeSpeedj(velocity_commands_, recv_timeout_ * 1000);
 
         } else if (freedrive_controller_running_ && freedrive_activated_) {
+            record_snapshot(3.0);  // freedrive keepalive
             eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_NOOP, recv_timeout_ * 1000);
         } else {
+            record_snapshot(0.0);  // idle while running
             eli_driver_->writeIdle(recv_timeout_ * 1000);
         }
     }
@@ -999,6 +1126,7 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::perform_comman
     (void)start_interfaces;
     (void)stop_interfaces;
     hardware_interface::return_type ret_val = hardware_interface::return_type::OK;
+    const std::string previous_mode = determineActiveControllerMode();
 
     if (stop_modes_[0].size() != 0 &&
         std::find(stop_modes_[0].begin(), stop_modes_[0].end(), hardware_interface::HW_IF_POSITION) != stop_modes_[0].end()) {
@@ -1040,7 +1168,81 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::perform_comman
     start_modes_.clear();
     stop_modes_.clear();
 
+    const std::string new_mode = determineActiveControllerMode();
+    if (new_mode != previous_mode) {
+        rotateMcapRecording(new_mode);
+    } else {
+        dt_hw_current_mode_ = new_mode;
+    }
+
     return ret_val;
+}
+
+std::string EliteCSPositionHardwareInterface::determineActiveControllerMode() const {
+    if (freedrive_controller_running_) {
+        return "freedrive";
+    }
+    if (position_controller_running_) {
+        return "position";
+    }
+    if (velocity_controller_running_) {
+        return "velocity";
+    }
+    return "idle";
+}
+
+void EliteCSPositionHardwareInterface::rotateMcapRecording(const std::string& new_mode) {
+    dt_hw_current_mode_ = new_mode;
+
+    if (!dt_hw_mcap_sink_ || dt_hw_mcap_base_path_.empty()) {
+        return;
+    }
+
+    namespace fs = std::filesystem;
+
+    try {
+        fs::path base_path(dt_hw_mcap_base_path_);
+        fs::path parent = base_path.parent_path();
+        std::string stem = base_path.stem().string();
+        if (stem.empty()) {
+            stem = "elite_hw_commands";
+        }
+        std::string extension = base_path.extension().string();
+        if (extension.empty()) {
+            extension = ".mcap";
+        }
+
+        std::string sanitized_mode;
+        sanitized_mode.reserve(new_mode.size());
+        for (char c : new_mode) {
+            unsigned char uc = static_cast<unsigned char>(c);
+            if (std::isalnum(uc)) {
+                sanitized_mode.push_back(static_cast<char>(std::tolower(uc)));
+            } else {
+                sanitized_mode.push_back('_');
+            }
+        }
+        if (sanitized_mode.empty()) {
+            sanitized_mode = "mode";
+        }
+
+        auto now = std::chrono::system_clock::now();
+        auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        uint64_t rotation_index = ++dt_hw_mcap_sequence_;
+
+        std::ostringstream filename;
+        filename << stem << '_' << epoch_ms << "_r" << rotation_index << '_' << sanitized_mode;
+        filename << extension;
+
+        fs::path full_path = parent.empty() ? fs::path(filename.str()) : parent / filename.str();
+
+        dt_hw_mcap_sink_->restartRecording(full_path.string());
+        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "DataTamer MCAP logging restarted at %s", full_path.string().c_str());
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "Failed to rotate DataTamer MCAP log: %s", e.what());
+    }
 }
 }  // namespace ELITE_CS_ROBOT_ROS_DRIVER
 
