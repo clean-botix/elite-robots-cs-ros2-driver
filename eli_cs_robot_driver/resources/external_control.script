@@ -148,9 +148,12 @@ def scriptCommands():
                 mass = raw_command[2] / COMMON_ZOOM_RATIO
                 cog = [raw_command[3] / COMMON_ZOOM_RATIO, raw_command[4] / COMMON_ZOOM_RATIO, raw_command[5] / COMMON_ZOOM_RATIO]
                 # Ensure message bytes evaluate to valid payload
-                if mass > 0.0 and mass <= 14.4:
-                    textmsg("Set payload mass: ", mass)
-                    textmsg("Set payload CoG: ", cog)
+                if mass >= 0.0 and mass <= 14.4:
+                    mass_str = 'mass: ' + str(mass)
+                    cog_str = 'CoG: ' + str(cog)
+                    payload_str = mass_str + ' | ' + cog_str
+                    # Updates with textmsg() can go missing if successive calls, so make it a single log string
+                    textmsg("Set payload:: ", payload_str)
                     set_payload(mass, cog)
             elif command == SCRIPT_CMD_SET_TOOL_VOLTAGE:
                 tool_voltage = raw_command[2] / COMMON_ZOOM_RATIO
@@ -273,6 +276,5 @@ textmsg("ExternalControl: All threads ended")
 socket_close("reverse_socket")
 socket_close("trajectory_socket")
 socket_close("script_command_socket")
-
 
 # NODE_CONTROL_LOOP_ENDS
