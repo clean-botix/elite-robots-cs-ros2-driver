@@ -45,13 +45,21 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_init(con
     runtime_state_ = ELITE::TaskStatus::STOPPED;
     controllers_initialized_ = false;
     system_interface_initialized_ = 0.0;
+
     resend_external_script_cmd_ = NO_NEW_CMD;
+    target_speed_fraction_cmd_ = NO_NEW_CMD;
+    zero_ftsensor_cmd_ = NO_NEW_CMD;
+    payload_mass_ = NO_NEW_CMD;
+    payload_center_of_gravity_ = {NO_NEW_CMD, NO_NEW_CMD, NO_NEW_CMD};
+    hand_back_control_cmd_ = NO_NEW_CMD;
+    freedrive_start_cmd_ = NO_NEW_CMD;
+    freedrive_end_cmd_ = NO_NEW_CMD;
+
     is_robot_connected_ = false;
     is_last_power_on_ = false;
 
     // Freedrive interface values init
     freedrive_controller_running_ = false;
-    freedrive_end_cmd_ = 0;
 
     for (size_t i = 0; i < STANDARD_DIG_GPIO_NUM; i++) {
         standard_dig_out_bits_cmd_[i] = NO_NEW_CMD;
@@ -839,7 +847,7 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
         freedrive_start_cmd_ = NO_NEW_CMD;
         freedrive_activated_ = true;
         RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Started freedrive mode");
-}
+    }
 
     if (!std::isnan(freedrive_end_cmd_) && eli_driver_ != nullptr) {
         freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_END, 0);
