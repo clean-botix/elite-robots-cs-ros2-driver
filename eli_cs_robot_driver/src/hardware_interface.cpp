@@ -4,6 +4,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
@@ -45,7 +46,6 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_init(con
     runtime_state_ = ELITE::TaskStatus::STOPPED;
     controllers_initialized_ = false;
     system_interface_initialized_ = 0.0;
-
     resend_external_script_cmd_ = NO_NEW_CMD;
     target_speed_fraction_cmd_ = NO_NEW_CMD;
     zero_ftsensor_cmd_ = NO_NEW_CMD;
@@ -54,7 +54,6 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_init(con
     hand_back_control_cmd_ = NO_NEW_CMD;
     freedrive_start_cmd_ = NO_NEW_CMD;
     freedrive_end_cmd_ = NO_NEW_CMD;
-
     is_robot_connected_ = false;
     is_last_power_on_ = false;
 
@@ -504,7 +503,24 @@ bool EliteCSPositionHardwareInterface::rtsiInit(const std::string& output_file, 
 
 void EliteCSPositionHardwareInterface::asyncThread() {
     while (async_thread_alive_) {
-        updateAsyncIO();
+        try {
+            updateAsyncIO();
+        } catch (const ELITE::EliteException& e) {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "RTSI async thread caught EliteException: %s. Stopping async loop.", e.what());
+            async_thread_alive_ = false;
+            if (rtsi_interface_) {
+                rtsi_interface_->disconnect();
+            }
+            break;
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(
+                rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "RTSI async thread caught std::exception: %s. Stopping async loop.", e.what());
+            async_thread_alive_ = false;
+            break;
+        }
         std::this_thread::sleep_for(40000000ns);
     }
 }
@@ -512,8 +528,20 @@ void EliteCSPositionHardwareInterface::asyncThread() {
 hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rclcpp::Time& time, const rclcpp::Duration& period) {
     (void)period;
     (void)time;
-    if (!rtsi_interface_->receiveData(rtsi_out_recipe_, true)) {
-        RCLCPP_FATAL(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "RTSI receive data: 'fail'.");
+    try {
+        if (!rtsi_interface_->receiveData(rtsi_out_recipe_, true)) {
+            RCLCPP_FATAL(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "RTSI receive data: 'fail'.");
+            return hardware_interface::return_type::ERROR;
+        }
+    } catch (const ELITE::EliteException& e) {
+        RCLCPP_ERROR(
+            rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+            "RTSI receive threw EliteException: %s", e.what());
+        return hardware_interface::return_type::ERROR;
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(
+            rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+            "RTSI receive threw std::exception: %s", e.what());
         return hardware_interface::return_type::ERROR;
     }
     rtsi_out_recipe_->getValue("actual_joint_positions", joint_positions_);
@@ -847,7 +875,7 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
         freedrive_start_cmd_ = NO_NEW_CMD;
         freedrive_activated_ = true;
         RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Started freedrive mode");
-    }
+}
 
     if (!std::isnan(freedrive_end_cmd_) && eli_driver_ != nullptr) {
         freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_END, 0);
@@ -1055,3 +1083,4 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::perform_comman
 #include "pluginlib/class_list_macros.hpp"
 
 PLUGINLIB_EXPORT_CLASS(ELITE_CS_ROBOT_ROS_DRIVER::EliteCSPositionHardwareInterface, hardware_interface::SystemInterface)
+
