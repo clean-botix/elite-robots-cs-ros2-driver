@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   sync-deps:
-    uses: getdevopspro/github-actions/.github/workflows/pr-create.yml@v6.7.0
+    uses: getdevopspro/github-actions/.github/workflows/pr-create.yml@v6.7.1
     secrets:
       token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
       ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
