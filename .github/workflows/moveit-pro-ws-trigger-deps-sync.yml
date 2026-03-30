@@ -20,7 +20,7 @@ jobs:
       token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
       ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
     with:
-      repository: ${{ github.repository_owner }}/OptimusClean-MoveItProWorkspace
+      repository: ${{ github.repository_owner }}/OptimusClean-MoveItPro
       ref: main
       lfs: true
       just-install: true
