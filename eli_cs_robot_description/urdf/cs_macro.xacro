@@ -65,6 +65,8 @@
     script_sender_port:=50002
     script_command_port:=50004
     trajectory_port:=50003
+    reconnect_grace_period_s:=300.0
+    reconnect_retry_interval_s:=2.0
     ">
 
     <!-- Load configuration data from the provided .yaml files -->
@@ -109,6 +111,8 @@
         script_sender_port="${script_sender_port}"
         script_command_port="${script_command_port}"
         trajectory_port="${trajectory_port}"
+        reconnect_grace_period_s="${reconnect_grace_period_s}"
+        reconnect_retry_interval_s="${reconnect_retry_interval_s}"
         />
     </xacro:if>
 

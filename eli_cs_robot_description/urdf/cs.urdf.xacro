@@ -24,7 +24,9 @@
    <xacro:arg name="headless_mode" default="false" />
    <xacro:arg name="robot_ip" default="0.0.0.0" />
    <xacro:arg name="local_ip" default="0.0.0.0"/>
-   <xacro:arg name="robot_connect_timeout" default="10" />   
+   <xacro:arg name="robot_connect_timeout" default="300" />
+   <xacro:arg name="reconnect_grace_period_s" default="300.0" />
+   <xacro:arg name="reconnect_retry_interval_s" default="2.0" />
    <xacro:arg name="robot_receive_timeout" default="0.2" />
    <xacro:arg name="servoj_gain" default="1000" />
    <xacro:arg name="servoj_lookahead_time" default="0.32" />
@@ -93,6 +95,8 @@
      robot_ip="$(arg robot_ip)"
      local_ip="$(arg local_ip)"
      robot_connect_timeout="$(arg robot_connect_timeout)"
+     reconnect_grace_period_s="$(arg reconnect_grace_period_s)"
+     reconnect_retry_interval_s="$(arg reconnect_retry_interval_s)"
      robot_receive_timeout="$(arg robot_receive_timeout)"
      servoj_gain="$(arg servoj_gain)"
      servoj_lookahead_time="$(arg servoj_lookahead_time)"
