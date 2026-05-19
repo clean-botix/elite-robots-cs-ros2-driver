@@ -53,7 +53,6 @@
     tool_tcp_port:=54321
     robot_ip:=0.0.0.0
     local_ip:=0.0.0.0
-    robot_connect_timeout:=10
     robot_receive_timeout:=0.2
     servoj_gain:=1000
     servoj_lookahead_time:=0.32
@@ -65,8 +64,8 @@
     script_sender_port:=50002
     script_command_port:=50004
     trajectory_port:=50003
-    reconnect_grace_period_s:=300.0
-    reconnect_retry_interval_s:=2.0
+    connect_grace_period_s:=30.0
+    connect_retry_interval_s:=2.0
     ">
 
     <!-- Load configuration data from the provided .yaml files -->
@@ -96,7 +95,6 @@
         tf_prefix="${tf_prefix}"
         robot_ip="${robot_ip}"
         local_ip="${local_ip}"
-        robot_connect_timeout="${robot_connect_timeout}"
         robot_receive_timeout="${robot_receive_timeout}"
         servoj_gain="${servoj_gain}"
         servoj_lookahead_time="${servoj_lookahead_time}"
@@ -111,8 +109,8 @@
         script_sender_port="${script_sender_port}"
         script_command_port="${script_command_port}"
         trajectory_port="${trajectory_port}"
-        reconnect_grace_period_s="${reconnect_grace_period_s}"
-        reconnect_retry_interval_s="${reconnect_retry_interval_s}"
+        connect_grace_period_s="${connect_grace_period_s}"
+        connect_retry_interval_s="${connect_retry_interval_s}"
         />
     </xacro:if>
 

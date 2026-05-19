@@ -5,19 +5,19 @@ namespace ELITE_CS_ROBOT_ROS_DRIVER {
 
 DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("dashboard_client", options) {
     this->declare_parameter<std::string>("robot_ip", "0.0.0.0");
-    this->declare_parameter<double>("connect_interval", 2.0); // seconds
+    this->declare_parameter<double>("connect_retry_interval_s", 2.0); // seconds
     this->declare_parameter<double>("health_check_interval", 5.0); // seconds
-    this->declare_parameter<int>("robot_connect_timeout", 300); // seconds
+    this->declare_parameter<double>("connect_grace_period_s", 30.0); // seconds
 
-    connect_interval_      = this->get_parameter("connect_interval").as_double();
-    health_check_interval_ = this->get_parameter("health_check_interval").as_double();
+    connect_retry_interval_s_ = this->get_parameter("connect_retry_interval_s").as_double();
+    health_check_interval_    = this->get_parameter("health_check_interval").as_double();
 
     connection_timer_ = this->create_wall_timer(
-        std::chrono::duration<double>(connect_interval_),
+        std::chrono::duration<double>(connect_retry_interval_s_),
         std::bind(&DashboardClient::attemptConnection, this));
 
-    robot_ip_ = this->get_parameter("robot_ip").as_string();
-    robot_connect_timeout_ = this->get_parameter("robot_connect_timeout").as_int();
+    robot_ip_               = this->get_parameter("robot_ip").as_string();
+    connect_grace_period_s_ = this->get_parameter("connect_grace_period_s").as_double();
     start_time_ = std::chrono::steady_clock::now();
 
     power_on_service_ = createTriggerService("~/power_on", [&]() -> bool { return client_.powerOn(); });
@@ -46,12 +46,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                 try {
                     resp->success = client_.popup(req->arg, req->message);
                 } catch(const ELITE::EliteException& e) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                        RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                            "Dashboard service call failed: %s", e.what());
-                        last_service_failure_log_time_ = now;
-                    }
+                    logServiceFailure(e);
                     resp->success = false;
                     resp->message = e.what();
                 }
@@ -65,12 +60,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                 try {
                     resp->success = client_.log(req->message);
                 } catch (const ELITE::EliteException& e) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                        RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                            "Dashboard service call failed: %s", e.what());
-                        last_service_failure_log_time_ = now;
-                    }
+                    logServiceFailure(e);
                     resp->success = false;
                     resp->message = e.what();
                 }
@@ -86,12 +76,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                     resp->status.status = (int8_t)client_.getTaskStatus();
                     resp->success = true;
                 } catch (const ELITE::EliteException& e) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                        RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                            "Dashboard service call failed: %s", e.what());
-                        last_service_failure_log_time_ = now;
-                    }
+                    logServiceFailure(e);
                     resp->success = false;
                     resp->message = e.what();
                 }
@@ -107,12 +92,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                     resp->is_saved = client_.isTaskSaved();
                     resp->success = true;
                 } catch (const ELITE::EliteException& e) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                        RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                            "Dashboard service call failed: %s", e.what());
-                        last_service_failure_log_time_ = now;
-                    }
+                    logServiceFailure(e);
                     resp->success = false;
                     resp->message = e.what();
                 }
@@ -128,12 +108,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                     resp->is_saved = !client_.isConfigurationModify();
                     resp->success = true;
                 } catch (const ELITE::EliteException& e) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                        RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                            "Dashboard service call failed: %s", e.what());
-                        last_service_failure_log_time_ = now;
-                    }
+                    logServiceFailure(e);
                     resp->success = false;
                     resp->message = e.what();
                 }
@@ -149,12 +124,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                     resp->mode.mode = (int8_t)client_.robotMode();
                     resp->success = true;
                 } catch (const ELITE::EliteException& e) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                        RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                            "Dashboard service call failed: %s", e.what());
-                        last_service_failure_log_time_ = now;
-                    }
+                    logServiceFailure(e);
                     resp->success = false;
                     resp->message = e.what();
                 }
@@ -170,12 +140,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                     resp->mode.mode = (int8_t)client_.safetyMode();
                     resp->success = true;
                 } catch (const ELITE::EliteException& e) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                        RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                            "Dashboard service call failed: %s", e.what());
-                        last_service_failure_log_time_ = now;
-                    }
+                    logServiceFailure(e);
                     resp->success = false;
                     resp->message = e.what();
                 }
@@ -190,12 +155,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                 resp->success = true;
                 resp->message = client_.getTaskPath();
             } catch (const ELITE::EliteException& e) {
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                    RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                        "Dashboard service call failed: %s", e.what());
-                    last_service_failure_log_time_ = now;
-                }
+                logServiceFailure(e);
                 resp->success = false;
                 resp->message = e.what();
             }
@@ -208,12 +168,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                 resp->success = client_.loadConfiguration(req->filename);
                 resp->answer = "Load configure: " + req->filename;
             } catch (const ELITE::EliteException& e) {
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                    RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                        "Dashboard service call failed: %s", e.what());
-                    last_service_failure_log_time_ = now;
-                }
+                logServiceFailure(e);
                 resp->success = false;
                 resp->answer = e.what();
             }
@@ -226,12 +181,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                 resp->success = client_.loadTask(req->filename);
                 resp->answer = "Load Task: " + req->filename;
             } catch (const ELITE::EliteException& e) {
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                    RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                        "Dashboard service call failed: %s", e.what());
-                    last_service_failure_log_time_ = now;
-                }
+                logServiceFailure(e);
                 resp->success = false;
                 resp->answer = e.what();
             }
@@ -244,12 +194,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
                 std::string robot_ip = this->get_parameter("robot_ip").as_string();
                 resp->success = client_.connect(robot_ip);
             } catch (const ELITE::EliteException& e) {
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                    RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                        "Dashboard service call failed: %s", e.what());
-                    last_service_failure_log_time_ = now;
-                }
+                logServiceFailure(e);
                 resp->success = false;
                 resp->message = e.what();
             }
@@ -261,12 +206,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
             try {
                 resp->response = client_.sendAndReceive(req->request);
             } catch(const ELITE::EliteException& e) {
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration<double>(now - last_service_failure_log_time_).count() >= 5.0) {
-                    RCLCPP_WARN(rclcpp::get_logger("EliteCSDashboardInterface"),
-                        "Dashboard service call failed: %s", e.what());
-                    last_service_failure_log_time_ = now;
-                }
+                logServiceFailure(e);
                 resp->response = e.what();
             }
         }
@@ -278,7 +218,7 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
  *
  * Handles both initial startup (is_reconnecting_ false) and post-failure
  * reconnection (is_reconnecting_ true). During initial startup, the function
- * enforces a total timeout window (robot_connect_timeout_ seconds): if the
+ * enforces a total timeout window (connect_grace_period_s_ seconds): if the
  * deadline expires before a connection is established, the node logs FATAL and
  * cancels the timer. During reconnection the timeout check is skipped because
  * checkConnection() has already reset start_time_ to begin a fresh window.
@@ -291,16 +231,16 @@ DashboardClient::DashboardClient(const rclcpp::NodeOptions& options) : Node("das
  * armed to begin liveness monitoring.
  */
 void DashboardClient::attemptConnection() {
-    if (!is_reconnecting_ && timeoutExpired(start_time_, robot_connect_timeout_)) {
+    if (!is_reconnecting_ && timeoutExpired(start_time_, static_cast<int>(connect_grace_period_s_))) {
         RCLCPP_FATAL_STREAM(
             rclcpp::get_logger("EliteCSDashboardInterface"),
-            "Could not connect to robot after " + std::to_string(robot_connect_timeout_) + " seconds");
+            "Could not connect to robot after " + std::to_string(connect_grace_period_s_) + " seconds");
         connection_timer_->cancel();
         return;
     }
 
     auto now = std::chrono::steady_clock::now();
-    bool should_log = std::chrono::duration<double>(now - last_connect_attempt_log_time_).count() >= 5.0;
+    bool should_log = std::chrono::duration<double>(now - last_connect_attempt_log_time_).count() >= kLogThrottleSeconds;
     if (should_log) {
         RCLCPP_INFO(rclcpp::get_logger("EliteCSDashboardInterface"), "Connecting to robot dashboard...");
         last_connect_attempt_log_time_ = now;
@@ -356,7 +296,7 @@ void DashboardClient::checkConnection() {
         health_check_timer_->cancel();
         start_time_       = std::chrono::steady_clock::now();
         connection_timer_ = this->create_wall_timer(
-            std::chrono::duration<double>(connect_interval_),
+            std::chrono::duration<double>(connect_retry_interval_s_),
             std::bind(&DashboardClient::attemptConnection, this));
     }
 }
