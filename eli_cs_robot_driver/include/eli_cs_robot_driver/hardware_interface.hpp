@@ -113,8 +113,7 @@ protected:
     // Log throttle gates — each caps its message category to 1 per kLogThrottleSeconds.
     std::chrono::steady_clock::time_point async_exception_log_time_{};
     std::chrono::steady_clock::time_point write_failure_log_time_{};
-    std::chrono::steady_clock::time_point reconnect_log_time_{};    // reconnect attempt + failure logs
-    std::chrono::steady_clock::time_point read_exception_log_time_{}; // read() RTSI exception logs
+    std::chrono::steady_clock::time_point reconnect_log_time_{};    // all reconnection-family logs (consolidated)
 
     // Connection timing — both startup loops and post-interruption retries use these values.
     // Sourced from URDF hardware parameters connect_grace_period_s / connect_retry_interval_s.
