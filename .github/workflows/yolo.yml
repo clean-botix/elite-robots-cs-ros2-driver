@@ -1,0 +1,19 @@
+name: YOLO
+on:
+  pull_request:
+    types: [ labeled ]
+
+jobs:
+  build:
+    if: ${{ github.event.label.name == 'YOLO' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: tibdex/github-app-token@v2
+        id: app-token
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - uses: hmarr/auto-approve-action@v4
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
