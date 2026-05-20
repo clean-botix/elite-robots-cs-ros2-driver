@@ -706,6 +706,12 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
             reconnect_last_attempt_time_ = {};
             reconnect_failed_.store(false);
             reconnection_needed_.store(true);
+            // Pre-disconnect mode observations must not be compared against post-reconnect
+            // state as if they were live transitions. Reset to UNKNOWN so the first frame
+            // after reconnection logs as a tracking-reset observation, not a false transition.
+            prev_robot_mode_    = ELITE::RobotMode::UNKNOWN;
+            prev_safety_mode_   = ELITE::SafetyMode::UNKNOWN;
+            prev_runtime_state_ = ELITE::TaskStatus::UNKNOWN;
         }
         // Log throttled: flapping resets reconnection_needed_ every cycle, so without a
         // time gate the "connection lost" message fires on every episode start.
@@ -786,26 +792,35 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
     safety_mode_iface_ = static_cast<double>(safety_mode_raw);
 
     if (robot_mode_copy_ != prev_robot_mode_) {
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-            "Robot mode changed: %s -> %s",
-            robotModeToString(prev_robot_mode_), robotModeToString(robot_mode_copy_));
-        if (prev_robot_mode_ == ELITE::RobotMode::RUNNING &&
-            robot_mode_copy_ != ELITE::RobotMode::RUNNING) {
-            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                "Robot left RUNNING mode -> now %s",
-                robotModeToString(robot_mode_copy_));
-        } else if (robot_mode_copy_ == ELITE::RobotMode::RUNNING &&
-                   prev_robot_mode_ != ELITE::RobotMode::UNKNOWN) {
+        if (prev_robot_mode_ == ELITE::RobotMode::UNKNOWN) {
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                "Robot returned to RUNNING mode — external control may resume");
+                "Robot mode (internal tracking reset): %s", robotModeToString(robot_mode_copy_));
+        } else {
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "Robot mode changed: %s -> %s",
+                robotModeToString(prev_robot_mode_), robotModeToString(robot_mode_copy_));
+            if (prev_robot_mode_ == ELITE::RobotMode::RUNNING &&
+                robot_mode_copy_ != ELITE::RobotMode::RUNNING) {
+                RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "Robot left RUNNING mode -> now %s",
+                    robotModeToString(robot_mode_copy_));
+            } else if (robot_mode_copy_ == ELITE::RobotMode::RUNNING) {
+                RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "Robot returned to RUNNING mode — external control may resume");
+            }
         }
         prev_robot_mode_ = robot_mode_copy_;
     }
 
     if (safety_mode_copy_ != prev_safety_mode_) {
-        RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-            "Safety mode changed: %s -> %s",
-            safetyModeToString(prev_safety_mode_), safetyModeToString(safety_mode_copy_));
+        if (prev_safety_mode_ == ELITE::SafetyMode::UNKNOWN) {
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "Safety mode (internal tracking reset): %s", safetyModeToString(safety_mode_copy_));
+        } else {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "Safety mode changed: %s -> %s",
+                safetyModeToString(prev_safety_mode_), safetyModeToString(safety_mode_copy_));
+        }
         prev_safety_mode_ = safety_mode_copy_;
     }
 
