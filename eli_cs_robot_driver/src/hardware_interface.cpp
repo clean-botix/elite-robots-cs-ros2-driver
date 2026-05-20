@@ -772,7 +772,7 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
         if (prev_robot_mode_ == ELITE::RobotMode::RUNNING &&
             robot_mode_copy_ != ELITE::RobotMode::RUNNING) {
             RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                "Robot left RUNNING mode — now %s",
+                "Robot left RUNNING mode -> now %s",
                 robotModeToString(robot_mode_copy_));
         } else if (robot_mode_copy_ == ELITE::RobotMode::RUNNING &&
                    prev_robot_mode_ != ELITE::RobotMode::UNKNOWN) {
@@ -853,10 +853,10 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
         freedrive_start_cmd_ = NO_NEW_CMD;
         freedrive_end_cmd_ = NO_NEW_CMD;
         is_last_power_on_ = true;
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Power off to power on");
+        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "POWER OFF to POWER ON");
     } else if(!robot_status_bits[0] && is_last_power_on_) {
         is_last_power_on_ = false;
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Power off");
+        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "POWER OFF");
     }
 
     // required transforms

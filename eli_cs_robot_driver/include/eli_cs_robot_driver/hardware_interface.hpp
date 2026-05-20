@@ -108,7 +108,7 @@ protected:
     std::atomic<bool> rtsi_reconnecting_{ false };
     // Standard throttle interval (s) for all repeated log messages. One log per this many
     // seconds prevents flooding during extended connection outages or write failures.
-    static constexpr double kLogThrottleSeconds = 5.0;
+    static constexpr double kLogThrottleSeconds = 10.0;
 
     // Log throttle gates — each caps its message category to 1 per kLogThrottleSeconds.
     std::chrono::steady_clock::time_point async_exception_log_time_{};

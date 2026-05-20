@@ -91,7 +91,7 @@ class DashboardClient : public rclcpp::Node {
     // Standard throttle interval for all repeated log messages — connection attempts,
     // failures, and service exceptions. One log per this many seconds prevents flooding
     // during extended outages.
-    static constexpr double kLogThrottleSeconds = 5.0;
+    static constexpr double kLogThrottleSeconds = 10.0;
 
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr createTriggerService(const std::string& name, std::function<bool()> func) {
         return this->create_service<std_srvs::srv::Trigger>(name, [&, func](const std_srvs::srv::Trigger::Request::SharedPtr req,
