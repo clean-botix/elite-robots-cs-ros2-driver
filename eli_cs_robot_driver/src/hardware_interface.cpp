@@ -1,4 +1,5 @@
 #include "eli_cs_robot_driver/hardware_interface.hpp"
+#include "eli_cs_robot_driver/throttled_sdk_log_handler.hpp"
 #include <Elite/EliteException.hpp>
 #include <algorithm>
 #include <bitset>
@@ -389,18 +390,26 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
     // distiguishable in the log
     const std::string tf_prefix = info_.hardware_parameters.at("tf_prefix");
 
+    // Register once: throttles repeated SDK per-source logs (e.g. RtsiClient.cpp
+    // connect-attempt pairs) to kLogThrottleSeconds. call_once is safe across
+    // lifecycle resets since the handler is owned by the SDK's global Logger.
+    static std::once_flag sdk_log_handler_flag;
+    std::call_once(sdk_log_handler_flag, []() {
+        ELITE::registerLogHandler(std::make_unique<ThrottledSdkLogHandler>());
+    });
+
     RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Initializing driver...");
 
-    // Read reconnect settings early — they govern both startup and post-interruption retries.
-    if (info_.hardware_parameters.count("reconnect_grace_period_s")) {
-        reconnect_grace_period_s_ = stod(info_.hardware_parameters["reconnect_grace_period_s"]);
+    // Read connection timing settings early — they govern both startup and post-interruption retries.
+    if (info_.hardware_parameters.count("connect_grace_period_s")) {
+        connect_grace_period_s_ = stod(info_.hardware_parameters["connect_grace_period_s"]);
     }
-    if (info_.hardware_parameters.count("reconnect_retry_interval_s")) {
-        reconnect_retry_interval_s_ = stod(info_.hardware_parameters["reconnect_retry_interval_s"]);
+    if (info_.hardware_parameters.count("connect_retry_interval_s")) {
+        connect_retry_interval_s_ = stod(info_.hardware_parameters["connect_retry_interval_s"]);
     }
     RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-        "Reconnection settings: grace_period=%.0fs, retry_interval=%.1fs",
-        reconnect_grace_period_s_, reconnect_retry_interval_s_);
+        "Connection settings: grace_period=%.0fs, retry_interval=%.1fs",
+        connect_grace_period_s_, connect_retry_interval_s_);
 
     auto start_time = std::chrono::steady_clock::now();
 
@@ -422,28 +431,28 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
 
         bool connected = false;
         while (!connected) {
-            if (timeoutExpired(start_time, static_cast<int>(reconnect_grace_period_s_))) {
+            if (timeoutExpired(start_time, static_cast<int>(connect_grace_period_s_))) {
                 throw ELITE::EliteException(ELITE::EliteException::Code::SOCKET_CONNECT_FAIL,
-                    "connection timeout after " + std::to_string(static_cast<int>(reconnect_grace_period_s_)) + " seconds");
+                    "connection timeout after " + std::to_string(static_cast<int>(connect_grace_period_s_)) + " seconds");
             }
 
             connected = eli_driver_->connect();
             rclcpp::sleep_for(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::duration<double>(reconnect_retry_interval_s_)));
+                std::chrono::duration<double>(connect_retry_interval_s_)));
         }
 
         rtsi_interface_ = std::make_unique<ELITE::RtsiClientInterface>();
 
         connected = false;
         while (!connected) {
-            if (timeoutExpired(start_time, static_cast<int>(reconnect_grace_period_s_))) {
+            if (timeoutExpired(start_time, static_cast<int>(connect_grace_period_s_))) {
                 throw ELITE::EliteException(ELITE::EliteException::Code::SOCKET_CONNECT_FAIL,
-                    "connection timeout after " + std::to_string(static_cast<int>(reconnect_grace_period_s_)) + " seconds");
+                    "connection timeout after " + std::to_string(static_cast<int>(connect_grace_period_s_)) + " seconds");
             }
 
             connected = rtsi_interface_->connect(robot_ip);
             rclcpp::sleep_for(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::duration<double>(reconnect_retry_interval_s_)));
+                std::chrono::duration<double>(connect_retry_interval_s_)));
         }
     } catch (const std::exception& e) {
         RCLCPP_FATAL_STREAM(rclcpp::get_logger("EliteCSPositionHardwareInterface"), e.what());
@@ -555,8 +564,14 @@ bool EliteCSPositionHardwareInterface::reconnectAll() {
     const std::string out_file  = info_.hardware_parameters.at("output_recipe_filename");
     const std::string in_file   = info_.hardware_parameters.at("input_recipe_filename");
 
-    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-        "reconnectAll: disconnecting RTSI...");
+    // Verbose "disconnecting / reconnecting" entry logs are omitted here — the caller
+    // (updateAsyncIO) already logs the attempt at the throttled cadence. Only failures
+    // and successes are logged from inside this function.
+    auto now = std::chrono::steady_clock::now();
+    // Failure logs are throttled: if we're retrying every connect_retry_interval_s_ we
+    // don't want to spam on every failed attempt.
+    bool should_log = std::chrono::duration<double>(now - reconnect_log_time_).count() >= kLogThrottleSeconds;
+
     rtsi_reconnecting_.store(true);
     rtsi_interface_.reset();
     rtsi_out_recipe_.reset();
@@ -564,14 +579,15 @@ bool EliteCSPositionHardwareInterface::reconnectAll() {
 
     rclcpp::sleep_for(std::chrono::milliseconds(500));
 
-    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-        "reconnectAll: reconnecting RTSI to %s...", robot_ip.c_str());
     try {
         rtsi_interface_ = std::make_unique<ELITE::RtsiClientInterface>();
 
         if (!rtsi_interface_->connect(robot_ip)) {
-            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                "reconnectAll: RTSI connect failed");
+            if (should_log) {
+                RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "reconnectAll: RTSI connect failed");
+                reconnect_log_time_ = now;
+            }
             // Null interface BEFORE clearing flag: read()'s null-guard must see null before
             // it sees the cleared flag, or it may call receiveData() on a broken socket.
             rtsi_interface_.reset();
@@ -580,28 +596,36 @@ bool EliteCSPositionHardwareInterface::reconnectAll() {
         }
 
         if (!rtsiInit(out_file, in_file)) {
-            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                "reconnectAll: RTSI recipe re-init failed");
+            if (should_log) {
+                RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "reconnectAll: RTSI recipe re-init failed");
+                reconnect_log_time_ = now;
+            }
             rtsi_interface_.reset();
             rtsi_reconnecting_.store(false);
             return false;
         }
         rtsi_reconnecting_.store(false);
     } catch (const ELITE::EliteException& e) {
-        RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-            "reconnectAll: RTSI exception: %s", e.what());
+        if (should_log) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "reconnectAll: RTSI exception: %s", e.what());
+            reconnect_log_time_ = now;
+        }
         rtsi_interface_.reset();
         rtsi_reconnecting_.store(false);
         return false;
     }
 
     if (!eli_driver_->isRobotConnected()) {
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-            "reconnectAll: control channel not connected — attempting EliteDriver reconnect...");
         if (!eli_driver_->connect()) {
-            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                "reconnectAll: EliteDriver connect failed (arm may still be booting or in local mode)");
+            if (should_log) {
+                RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "reconnectAll: EliteDriver connect failed (arm may still be booting or in local mode)");
+                reconnect_log_time_ = now;
+            }
         } else {
+            // Success — always log immediately regardless of throttle gate.
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                 "reconnectAll: EliteDriver control channel reconnected");
         }
@@ -624,14 +648,14 @@ void EliteCSPositionHardwareInterface::asyncThread() {
             updateAsyncIO();
         } catch (const std::exception& e) {
             auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration<double>(now - async_exception_log_time_).count() >= 5.0) {
+            if (std::chrono::duration<double>(now - async_exception_log_time_).count() >= kLogThrottleSeconds) {
                 RCLCPP_ERROR(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                     "asyncThread caught exception from updateAsyncIO: %s", e.what());
                 async_exception_log_time_ = now;
             }
         } catch (...) {
             auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration<double>(now - async_exception_log_time_).count() >= 5.0) {
+            if (std::chrono::duration<double>(now - async_exception_log_time_).count() >= kLogThrottleSeconds) {
                 RCLCPP_ERROR(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                     "asyncThread caught unknown exception from updateAsyncIO");
                 async_exception_log_time_ = now;
@@ -667,19 +691,30 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
         try {
             recv_ok = rtsi_interface_->receiveData(rtsi_out_recipe_, true);
         } catch (const std::exception& e) {
-            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                "read() caught RTSI exception: %s", e.what());
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - reconnect_log_time_).count() >= kLogThrottleSeconds) {
+                RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "read() caught RTSI exception: %s", e.what());
+                reconnect_log_time_ = now;
+            }
         }
     }
     if (!recv_ok) {
         if (!reconnection_needed_.load()) {
-            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                "RTSI receiveData failed — initiating reconnection (grace period %.0fs, retry interval %.1fs)",
-                reconnect_grace_period_s_, reconnect_retry_interval_s_);
+            // State update always runs regardless of throttle — arms reconnection state machine.
             reconnect_start_time_        = std::chrono::steady_clock::now();
             reconnect_last_attempt_time_ = {};
             reconnect_failed_.store(false);
             reconnection_needed_.store(true);
+        }
+        // Log throttled: flapping resets reconnection_needed_ every cycle, so without a
+        // time gate the "connection lost" message fires on every episode start.
+        auto now_fail = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now_fail - reconnect_log_time_).count() >= kLogThrottleSeconds) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "RTSI receiveData failed — connection lost (grace period %.0fs, retry interval %.1fs)",
+                connect_grace_period_s_, connect_retry_interval_s_);
+            reconnect_log_time_ = now_fail;
         }
 
         if (reconnect_failed_.load()) {
@@ -688,10 +723,10 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
             return hardware_interface::return_type::ERROR;
         }
 
-        if (timeoutExpired(reconnect_start_time_, static_cast<int>(reconnect_grace_period_s_))) {
+        if (timeoutExpired(reconnect_start_time_, static_cast<int>(connect_grace_period_s_))) {
             RCLCPP_FATAL(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                 "RTSI reconnection grace period (%.1fs) expired without success — giving up",
-                reconnect_grace_period_s_);
+                connect_grace_period_s_);
             return hardware_interface::return_type::ERROR;
         }
 
@@ -699,8 +734,12 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
     }
 
     if (reconnection_needed_.load()) {
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-            "RTSI data received successfully — reconnection resolved");
+        auto now_res = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now_res - reconnect_log_time_).count() >= kLogThrottleSeconds) {
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "RTSI data received successfully — reconnection resolved");
+            reconnect_log_time_ = now_res;
+        }
         reconnection_needed_.store(false);
         reconnect_failed_.store(false);
     }
@@ -753,7 +792,7 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
         if (prev_robot_mode_ == ELITE::RobotMode::RUNNING &&
             robot_mode_copy_ != ELITE::RobotMode::RUNNING) {
             RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                "Robot left RUNNING mode — now %s",
+                "Robot left RUNNING mode -> now %s",
                 robotModeToString(robot_mode_copy_));
         } else if (robot_mode_copy_ == ELITE::RobotMode::RUNNING &&
                    prev_robot_mode_ != ELITE::RobotMode::UNKNOWN) {
@@ -768,6 +807,24 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
             "Safety mode changed: %s -> %s",
             safetyModeToString(prev_safety_mode_), safetyModeToString(safety_mode_copy_));
         prev_safety_mode_ = safety_mode_copy_;
+    }
+
+    // Detect EliteScript task EXECUTING/stopped transitions. Mirrors robot_mode and
+    // safety_mode transition logging above. Only EXECUTING→stopped generates a WARN
+    // since that indicates unexpected task death during active control.
+    if (runtime_state_ != prev_runtime_state_) {
+        if (prev_runtime_state_ == ELITE::TaskStatus::PLAYING &&
+            runtime_state_ != ELITE::TaskStatus::PLAYING) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "EliteScript task stopped (EXECUTING -> %s)",
+                runtime_state_ == ELITE::TaskStatus::STOPPED  ? "STOPPED"  :
+                runtime_state_ == ELITE::TaskStatus::PAUSED   ? "PAUSED"   : "UNKNOWN");
+        } else if (runtime_state_ == ELITE::TaskStatus::PLAYING &&
+                   prev_runtime_state_ != ELITE::TaskStatus::UNKNOWN) {
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "EliteScript task is now EXECUTING");
+        }
+        prev_runtime_state_ = runtime_state_;
     }
 
     uint32_t analog_types = 0;
@@ -834,10 +891,10 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
         freedrive_start_cmd_ = NO_NEW_CMD;
         freedrive_end_cmd_ = NO_NEW_CMD;
         is_last_power_on_ = true;
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Power off to power on");
+        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "POWER OFF to POWER ON");
     } else if(!robot_status_bits[0] && is_last_power_on_) {
         is_last_power_on_ = false;
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Power off");
+        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "POWER OFF");
     }
 
     // required transforms
@@ -878,17 +935,35 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::write(const rc
             }
             if (!write_ok) {
                 auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration<double>(now - write_failure_log_time_).count() >= 5.0) {
+                if (std::chrono::duration<double>(now - write_failure_log_time_).count() >= kLogThrottleSeconds) {
                     RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                        "Write command to robot failed (runtime_state=%d, is_robot_connected=%d)",
-                        static_cast<int>(runtime_state_), static_cast<int>(is_robot_connected_));
+                        "Write command to robot failed (runtime_state=%s, robot=%s)",
+                        runtime_state_ == ELITE::TaskStatus::PLAYING ? "EXECUTING" :
+                        runtime_state_ == ELITE::TaskStatus::STOPPED ? "STOPPED"   :
+                        runtime_state_ == ELITE::TaskStatus::PAUSED  ? "PAUSED"    : "UNKNOWN",
+                        is_robot_connected_ ? "connected" : "disconnected");
+                    write_failure_log_time_ = now;
+                }
+            }
+        } else {
+            // Log suppressed motion commands when a controller is active but the EliteScript
+            // task is not EXECUTING or the robot is disconnected.
+            if (position_controller_running_ || velocity_controller_running_ || freedrive_controller_running_) {
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - write_failure_log_time_).count() >= kLogThrottleSeconds) {
+                    RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                        "Driver external control EliteScript task not EXECUTING "
+                        "(runtime_state=%s, driver=%s)",
+                        runtime_state_ == ELITE::TaskStatus::STOPPED ? "STOPPED" :
+                        runtime_state_ == ELITE::TaskStatus::PAUSED  ? "PAUSED"  : "UNKNOWN",
+                        is_robot_connected_ ? "connected" : "disconnected");
                     write_failure_log_time_ = now;
                 }
             }
         }
     } catch (const std::exception& e) {
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(now - write_failure_log_time_).count() >= 5.0) {
+        if (std::chrono::duration<double>(now - write_failure_log_time_).count() >= kLogThrottleSeconds) {
             RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                 "write() caught exception: %s", e.what());
             write_failure_log_time_ = now;
@@ -1039,9 +1114,9 @@ bool EliteCSPositionHardwareInterface::updateToolVoltage(bool* is_update) {
  * detect the failed flag and return ERROR on its next invocation.
  *
  * Timing: reconnection attempts use a fixed-interval model. If
- * reconnect_retry_interval_s_ seconds have elapsed since the last attempt,
+ * connect_retry_interval_s_ seconds have elapsed since the last attempt,
  * reconnectAll() is called. If the total elapsed time exceeds
- * reconnect_grace_period_s_, reconnect_failed_ is set and no further attempts
+ * connect_grace_period_s_, reconnect_failed_ is set and no further attempts
  * are made. This matches the cadence used during startup, giving predictable
  * and observable retry behavior.
  */
@@ -1056,23 +1131,32 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
         if (!reconnect_failed_.load()) {
             auto now = std::chrono::steady_clock::now();
 
-            if (timeoutExpired(reconnect_start_time_, static_cast<int>(reconnect_grace_period_s_))) {
+            if (timeoutExpired(reconnect_start_time_, static_cast<int>(connect_grace_period_s_))) {
                 RCLCPP_FATAL(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                     "Reconnection timed out after %.0f seconds — flagging as unrecoverable",
-                    reconnect_grace_period_s_);
+                    connect_grace_period_s_);
                 reconnect_failed_.store(true);
                 return;
             }
 
             double since_last = std::chrono::duration<double>(now - reconnect_last_attempt_time_).count();
-            if (since_last >= reconnect_retry_interval_s_) {
+            if (since_last >= connect_retry_interval_s_) {
                 reconnect_last_attempt_time_ = now;
                 double elapsed = std::chrono::duration<double>(now - reconnect_start_time_).count();
-                RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                    "Reconnection attempt (%.0f/%.0f s elapsed)...", elapsed, reconnect_grace_period_s_);
-                if (reconnectAll()) {
+                // Log the attempt at most once per kLogThrottleSeconds to avoid flooding
+                // when connect_retry_interval_s_ < kLogThrottleSeconds.
+                if (std::chrono::duration<double>(now - reconnect_log_time_).count() >= kLogThrottleSeconds) {
                     RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                        "Reconnection succeeded");
+                        "Reconnection attempt (%.0f/%.0f s elapsed)...", elapsed, connect_grace_period_s_);
+                    reconnect_log_time_ = now;
+                }
+                if (reconnectAll()) {
+                    auto now_succ = std::chrono::steady_clock::now();
+                    if (std::chrono::duration<double>(now_succ - reconnect_log_time_).count() >= kLogThrottleSeconds) {
+                        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                            "Reconnection succeeded");
+                        reconnect_log_time_ = now_succ;
+                    }
                     reconnection_needed_.store(false);
                     reconnect_failed_.store(false);
                 }
@@ -1102,22 +1186,34 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
 
     if (!std::isnan(resend_external_script_cmd_) && eli_driver_ != nullptr) {
         try {
-            eli_driver_->sendScript("stop task\n");
+            // Stop the currently executing EliteScript task via the reverse port, not
+            // Primary port, to avoid triggering a spurious PrimaryPort::sendScript() log.
+            // stopControl() is synchronous — it waits for the arm's external control
+            // script to exit before returning. If the arm is not running external control,
+            // stopControl() returns immediately.
+            eli_driver_->stopControl(5000);
+            // RTSI lags hardware state by up to one cycle (4 ms). Brief wait confirms
+            // runtime_state_ has transitioned before we send the new script.
             auto wait_start = std::chrono::steady_clock::now();
-            constexpr int STOP_TIMEOUT_MS = 5000;
+            constexpr int RTSI_CONFIRM_TIMEOUT_MS = 500;
             while (runtime_state_ != ELITE::TaskStatus::STOPPED) {
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - wait_start).count();
-                if (elapsed > STOP_TIMEOUT_MS) {
+                if (elapsed > RTSI_CONFIRM_TIMEOUT_MS) {
                     RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                        "Timed out waiting for robot task to stop before script resend");
+                        "Timed out waiting for RTSI to confirm STOPPED after stopControl()");
                     break;
                 }
                 std::this_thread::sleep_for(10ms);
             }
             resend_external_script_async_success_ = eli_driver_->sendExternalControlScript();
-            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Send external control: %s",
-                        resend_external_script_async_success_ ? "success" : "fail");
+            if (resend_external_script_async_success_) {
+                RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "External control script sent to arm controller");
+            } else {
+                RCLCPP_ERROR(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "External control script send to arm controller failed network socket delivery");
+            }
         } catch (const ELITE::EliteException& e) {
             RCLCPP_ERROR(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Script resend failed: '%s'", e.what());
         }
@@ -1132,28 +1228,57 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
 
     if (!std::isnan(payload_mass_) && !std::isnan(payload_center_of_gravity_[0]) && !std::isnan(payload_center_of_gravity_[1]) &&
         !std::isnan(payload_center_of_gravity_[2]) && eli_driver_ != nullptr) {
+        // Guard: setPayload() requires the EliteScript task to be EXECUTING.
+        if (runtime_state_ != ELITE::TaskStatus::PLAYING) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "payload requested but EliteScript task is not EXECUTING — skipping");
+            payload_async_success_ = false;
+        } else {
             payload_async_success_ = eli_driver_->setPayload(payload_mass_, payload_center_of_gravity_);
-            payload_mass_ = NO_NEW_CMD;
-            payload_center_of_gravity_ = {NO_NEW_CMD, NO_NEW_CMD, NO_NEW_CMD};
+        }
+        payload_mass_ = NO_NEW_CMD;
+        payload_center_of_gravity_ = {NO_NEW_CMD, NO_NEW_CMD, NO_NEW_CMD};
     }
 
     if (!std::isnan(zero_ftsensor_cmd_) && eli_driver_ != nullptr) {
-        zero_ftsensor_async_success_ = eli_driver_->zeroFTSensor();
+        // Guard: zeroFTSensor() requires the EliteScript task to be EXECUTING.
+        if (runtime_state_ != ELITE::TaskStatus::PLAYING) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "zero_ftsensor requested but EliteScript task is not EXECUTING — skipping");
+            zero_ftsensor_async_success_ = false;
+        } else {
+            zero_ftsensor_async_success_ = eli_driver_->zeroFTSensor();
+        }
         zero_ftsensor_cmd_ = NO_NEW_CMD;
     }
 
     if (!std::isnan(freedrive_start_cmd_) && eli_driver_ != nullptr) {
-        freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_START, 0);
+        // Guard: writeFreedrive() requires the EliteScript task to be EXECUTING.
+        if (runtime_state_ != ELITE::TaskStatus::PLAYING) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "freedrive_start requested but EliteScript task is not EXECUTING — skipping");
+            freedrive_async_success_ = false;
+        } else {
+            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_START, 0);
+            freedrive_activated_ = true;
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Started freedrive mode");
+        }
         freedrive_start_cmd_ = NO_NEW_CMD;
-        freedrive_activated_ = true;
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Started freedrive mode");
     }
 
     if (!std::isnan(freedrive_end_cmd_) && eli_driver_ != nullptr) {
-        freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_END, 0);
-        freedrive_end_cmd_ = NO_NEW_CMD;
+        // Always clear local freedrive state even if the task is down, to keep driver
+        // state consistent with what write() will see on the next cycle.
         freedrive_activated_ = false;
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Ended freedrive mode");
+        if (runtime_state_ != ELITE::TaskStatus::PLAYING) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "freedrive_end requested but EliteScript task is not EXECUTING — skipping SDK call");
+            freedrive_async_success_ = false;
+        } else {
+            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_END, 0);
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Ended freedrive mode");
+        }
+        freedrive_end_cmd_ = NO_NEW_CMD;
     }
 
     if (rtsi_interface_->isConnected()) {

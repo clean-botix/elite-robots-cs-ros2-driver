@@ -46,7 +46,7 @@ constexpr char ELITE_HW_IF_FREEDRIVE[] = "freedrive_mode";
  * Post-interruption reconnection: when read() detects a failed RTSI receive, it
  * arms a reconnection state machine (reconnection_needed_, reconnect_start_time_).
  * The async thread drives fixed-interval reconnection attempts via reconnectAll()
- * for up to reconnect_grace_period_s_ seconds. If the grace period expires,
+ * for up to connect_grace_period_s_ seconds. If the grace period expires,
  * reconnect_failed_ is set and read() returns ERROR on its next invocation.
  *
  * Thread-safe RTSI teardown: rtsi_reconnecting_ guards read() from calling
@@ -106,19 +106,25 @@ protected:
     std::chrono::steady_clock::time_point reconnect_start_time_;
     std::chrono::steady_clock::time_point reconnect_last_attempt_time_{};
     std::atomic<bool> rtsi_reconnecting_{ false };
-    // Log throttle gates for write() failures and async-thread exceptions
+    // Standard throttle interval (s) for all repeated log messages. One log per this many
+    // seconds prevents flooding during extended connection outages or write failures.
+    static constexpr double kLogThrottleSeconds = 10.0;
+
+    // Log throttle gates — each caps its message category to 1 per kLogThrottleSeconds.
     std::chrono::steady_clock::time_point async_exception_log_time_{};
     std::chrono::steady_clock::time_point write_failure_log_time_{};
+    std::chrono::steady_clock::time_point reconnect_log_time_{};    // all reconnection-family logs (consolidated)
 
-    // Reconnection timing — both startup loops and post-interruption retries use these values.
-    // Sourced from URDF hardware parameters reconnect_grace_period_s / reconnect_retry_interval_s.
-    double reconnect_grace_period_s_{ 300.0 };
-    double reconnect_retry_interval_s_{ 2.0 };
+    // Connection timing — both startup loops and post-interruption retries use these values.
+    // Sourced from URDF hardware parameters connect_grace_period_s / connect_retry_interval_s.
+    double connect_grace_period_s_{ 30.0 };
+    double connect_retry_interval_s_{ 2.0 };
 
     // Robot mode tracking for logging transitions
     ELITE::RobotMode  prev_robot_mode_{ ELITE::RobotMode::UNKNOWN };
     ELITE::SafetyMode prev_safety_mode_{ ELITE::SafetyMode::UNKNOWN };
     ELITE::TaskStatus runtime_state_;
+    ELITE::TaskStatus prev_runtime_state_{ ELITE::TaskStatus::UNKNOWN };
     // resources switching aux vars
     std::vector<std::vector<std::string>> stop_modes_;
     std::vector<std::vector<std::string>> start_modes_;
