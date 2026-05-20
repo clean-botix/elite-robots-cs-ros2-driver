@@ -789,6 +789,25 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
         prev_safety_mode_ = safety_mode_copy_;
     }
 
+    // Detect EliteScript task EXECUTING/stopped transitions. Mirrors robot_mode and
+    // safety_mode transition logging above. Only EXECUTING→stopped generates a WARN
+    // since that indicates unexpected task death during active control.
+    if (runtime_state_ != prev_runtime_state_) {
+        if (prev_runtime_state_ == ELITE::TaskStatus::PLAYING &&
+            runtime_state_ != ELITE::TaskStatus::PLAYING) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "EliteScript task stopped unexpectedly (EXECUTING -> %s) — "
+                "motion commands will be suppressed until the task is restarted",
+                runtime_state_ == ELITE::TaskStatus::STOPPED  ? "STOPPED"  :
+                runtime_state_ == ELITE::TaskStatus::PAUSED   ? "PAUSED"   : "UNKNOWN");
+        } else if (runtime_state_ == ELITE::TaskStatus::PLAYING &&
+                   prev_runtime_state_ != ELITE::TaskStatus::UNKNOWN) {
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "EliteScript task is now EXECUTING — motion commands will resume");
+        }
+        prev_runtime_state_ = runtime_state_;
+    }
+
     uint32_t analog_types = 0;
     rtsi_out_recipe_->getValue("analog_io_types", analog_types);
     std::bitset<4> analog_types_bits = analog_types;
@@ -900,6 +919,19 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::write(const rc
                 if (std::chrono::duration<double>(now - write_failure_log_time_).count() >= kLogThrottleSeconds) {
                     RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                         "Write command to robot failed (runtime_state=%d, is_robot_connected=%d)",
+                        static_cast<int>(runtime_state_), static_cast<int>(is_robot_connected_));
+                    write_failure_log_time_ = now;
+                }
+            }
+        } else {
+            // Log suppressed motion commands when a controller is active but the EliteScript
+            // task is not EXECUTING or the robot is disconnected.
+            if (position_controller_running_ || velocity_controller_running_ || freedrive_controller_running_) {
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - write_failure_log_time_).count() >= kLogThrottleSeconds) {
+                    RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                        "Motion commands suppressed — EliteScript task not EXECUTING "
+                        "(runtime_state=%d, is_robot_connected=%d)",
                         static_cast<int>(runtime_state_), static_cast<int>(is_robot_connected_));
                     write_failure_log_time_ = now;
                 }
@@ -1141,8 +1173,13 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
                 std::this_thread::sleep_for(10ms);
             }
             resend_external_script_async_success_ = eli_driver_->sendExternalControlScript();
-            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Send external control: %s",
-                        resend_external_script_async_success_ ? "success" : "fail");
+            if (resend_external_script_async_success_) {
+                RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "External control script sent to arm controller");
+            } else {
+                RCLCPP_ERROR(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "External control script send to arm controller failed network socket delivery");
+            }
         } catch (const ELITE::EliteException& e) {
             RCLCPP_ERROR(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Script resend failed: '%s'", e.what());
         }
@@ -1157,28 +1194,57 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
 
     if (!std::isnan(payload_mass_) && !std::isnan(payload_center_of_gravity_[0]) && !std::isnan(payload_center_of_gravity_[1]) &&
         !std::isnan(payload_center_of_gravity_[2]) && eli_driver_ != nullptr) {
+        // Guard: setPayload() requires the EliteScript task to be EXECUTING.
+        if (runtime_state_ != ELITE::TaskStatus::PLAYING) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "payload requested but EliteScript task is not EXECUTING — skipping");
+            payload_async_success_ = false;
+        } else {
             payload_async_success_ = eli_driver_->setPayload(payload_mass_, payload_center_of_gravity_);
-            payload_mass_ = NO_NEW_CMD;
-            payload_center_of_gravity_ = {NO_NEW_CMD, NO_NEW_CMD, NO_NEW_CMD};
+        }
+        payload_mass_ = NO_NEW_CMD;
+        payload_center_of_gravity_ = {NO_NEW_CMD, NO_NEW_CMD, NO_NEW_CMD};
     }
 
     if (!std::isnan(zero_ftsensor_cmd_) && eli_driver_ != nullptr) {
-        zero_ftsensor_async_success_ = eli_driver_->zeroFTSensor();
+        // Guard: zeroFTSensor() requires the EliteScript task to be EXECUTING.
+        if (runtime_state_ != ELITE::TaskStatus::PLAYING) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "zero_ftsensor requested but EliteScript task is not EXECUTING — skipping");
+            zero_ftsensor_async_success_ = false;
+        } else {
+            zero_ftsensor_async_success_ = eli_driver_->zeroFTSensor();
+        }
         zero_ftsensor_cmd_ = NO_NEW_CMD;
     }
 
     if (!std::isnan(freedrive_start_cmd_) && eli_driver_ != nullptr) {
-        freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_START, 0);
+        // Guard: writeFreedrive() requires the EliteScript task to be EXECUTING.
+        if (runtime_state_ != ELITE::TaskStatus::PLAYING) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "freedrive_start requested but EliteScript task is not EXECUTING — skipping");
+            freedrive_async_success_ = false;
+        } else {
+            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_START, 0);
+            freedrive_activated_ = true;
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Started freedrive mode");
+        }
         freedrive_start_cmd_ = NO_NEW_CMD;
-        freedrive_activated_ = true;
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Started freedrive mode");
     }
 
     if (!std::isnan(freedrive_end_cmd_) && eli_driver_ != nullptr) {
-        freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_END, 0);
-        freedrive_end_cmd_ = NO_NEW_CMD;
+        // Always clear local freedrive state even if the task is down, to keep driver
+        // state consistent with what write() will see on the next cycle.
         freedrive_activated_ = false;
-        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Ended freedrive mode");
+        if (runtime_state_ != ELITE::TaskStatus::PLAYING) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "freedrive_end requested but EliteScript task is not EXECUTING — skipping SDK call");
+            freedrive_async_success_ = false;
+        } else {
+            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_END, 0);
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Ended freedrive mode");
+        }
+        freedrive_end_cmd_ = NO_NEW_CMD;
     }
 
     if (rtsi_interface_->isConnected()) {

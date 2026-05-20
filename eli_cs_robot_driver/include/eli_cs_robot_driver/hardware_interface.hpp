@@ -125,6 +125,7 @@ protected:
     ELITE::RobotMode  prev_robot_mode_{ ELITE::RobotMode::UNKNOWN };
     ELITE::SafetyMode prev_safety_mode_{ ELITE::SafetyMode::UNKNOWN };
     ELITE::TaskStatus runtime_state_;
+    ELITE::TaskStatus prev_runtime_state_{ ELITE::TaskStatus::UNKNOWN };
     // resources switching aux vars
     std::vector<std::vector<std::string>> stop_modes_;
     std::vector<std::vector<std::string>> start_modes_;
