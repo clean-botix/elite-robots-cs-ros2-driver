@@ -6,6 +6,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -25,17 +26,24 @@ public:
             const char* slash = std::strrchr(file, '/');
             const char* basename = slash ? slash + 1 : file;
 
-            auto now = std::chrono::steady_clock::now();
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto key = std::make_pair(std::string(basename), level);
-            auto it = throttle_map_.find(key);
-            if (it != throttle_map_.end()) {
-                if (std::chrono::duration<double>(now - it->second).count() < kLogThrottleSeconds) {
-                    return;
+            // TcpServer.cpp logs arm controller connect/disconnect events — low-frequency,
+            // operationally significant events that must never be suppressed. All three ports
+            // log from this file nearly simultaneously, so without this exemption only the
+            // first event in a 10s window would appear.
+            static const std::set<std::string> no_throttle_files = {"TcpServer.cpp"};
+            if (!no_throttle_files.count(basename)) {
+                auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto key = std::make_pair(std::string(basename), level);
+                auto it = throttle_map_.find(key);
+                if (it != throttle_map_.end()) {
+                    if (std::chrono::duration<double>(now - it->second).count() < kLogThrottleSeconds) {
+                        return;
+                    }
+                    it->second = now;
+                } else {
+                    throttle_map_.emplace(key, now);
                 }
-                it->second = now;
-            } else {
-                throttle_map_.emplace(key, now);
             }
         }
         const char* level_str =
