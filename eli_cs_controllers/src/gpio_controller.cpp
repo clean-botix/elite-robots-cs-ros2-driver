@@ -443,6 +443,8 @@ bool GPIOController::resendRobotControlScript(std_srvs::srv::Trigger::Request::S
     auto phase_start = std::chrono::steady_clock::now();
 
     while (state_interfaces_[(int)StateOffset::TASK_RUNNING].get_value() != 1.0) {
+        // Abort on shutdown: hardware interface is shutting down; state will not update.
+        if (!rclcpp::ok()) { resp->success = false; return false; }
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - phase_start).count() > TASK_START_TIMEOUT_MS) {
             RCLCPP_ERROR(get_node()->get_logger(),
@@ -460,6 +462,8 @@ bool GPIOController::resendRobotControlScript(std_srvs::srv::Trigger::Request::S
     auto dwell_start = std::chrono::steady_clock::now();
     while (std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - dwell_start).count() < TASK_STABLE_DWELL_MS) {
+        // Abort on shutdown: no point confirming task stability during driver teardown.
+        if (!rclcpp::ok()) { resp->success = false; return false; }
         if (state_interfaces_[(int)StateOffset::TASK_RUNNING].get_value() != 1.0) {
             RCLCPP_ERROR(get_node()->get_logger(),
                 "EliteScript task entered EXECUTING state but then stopped — "
@@ -569,6 +573,10 @@ bool GPIOController::waitForAsyncCommand(std::function<double(void)> get_value) 
     const auto maximum_retries = params_.check_io_successfull_retries;
     int retries = 0;
     while (get_value() == ASYNC_WAITING) {
+        // Abort if ROS2 is shutting down: the hardware interface async thread that
+        // processes commands has already exited, so the command will never complete.
+        // Without this check the executor's spin() cannot return, blocking on_cleanup().
+        if (!rclcpp::ok()) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         retries++;
 
