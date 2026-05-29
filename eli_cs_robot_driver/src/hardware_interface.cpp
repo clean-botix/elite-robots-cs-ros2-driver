@@ -19,8 +19,7 @@ namespace ELITE_CS_ROBOT_ROS_DRIVER {
 using namespace std::chrono;
 
 EliteCSPositionHardwareInterface::~EliteCSPositionHardwareInterface() {
-    // If the controller manager is shutdown via Ctrl + C the on_deactivate methods won't be called.
-    // We therefore need to make sure to actually deactivate the communication
+    // Ensure we deactivate the communication as a worst-case fallback during deconstruction
     on_cleanup(rclcpp_lifecycle::State());
 }
 
@@ -346,7 +345,7 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
     stop_modes_.clear();
     start_modes_.clear();
 
-    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Starting... please wait...");
+    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Starting...");
 
     // The robot's IP address.
     const std::string robot_ip = info_.hardware_parameters["robot_ip"];
@@ -469,30 +468,53 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
     async_thread_alive_.store(true);
     async_thread_ = std::make_unique<std::thread>([&]() { asyncThread(); });
 
-    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "System successfully started!");
+    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "System successfully started");
 
     return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_activate(const rclcpp_lifecycle::State& previous_state) {
     (void)previous_state;
-    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Activating HW interface");
+    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Activating hardware interface");
     return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_cleanup(const rclcpp_lifecycle::State& previous_state) {
     (void)previous_state;
-    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Stopping ...please wait...");
 
+    // Likely to be silent as ROS2 logging will be torn down during shutdown
+    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Stopping...");
+
+    // Stop the async thread first so no concurrent writeServoj/writeSpeedj calls
+    // can race with the stopControl() call below.
     if (async_thread_) {
         async_thread_alive_.store(false);
         async_thread_->join();
         async_thread_.reset();
     }
-    rtsi_interface_.reset();
-    eli_driver_.reset();
 
-    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "System successfully stopped!");
+    // Signal the robot's external control script to exit cleanly before dropping the
+    // connection. Without this, the arm waits for its own socket-timeout (3–10 s) before
+    // exiting external control. WARN (not ERROR) because a false return or exception is
+    // expected when the network is already down — it is not a failure of shutdown itself.
+    if (eli_driver_) {
+        try {
+            if (!eli_driver_->stopControl(2000)) {
+                RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "stopControl() returned false during cleanup (robot may already be disconnected)");
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "stopControl() threw during cleanup: '%s'", e.what());
+        }
+    }
+
+    // eli_driver_ before rtsi_interface_:
+    // Keep the RTSI stream alive until after the driver for observability
+    eli_driver_.reset();
+    rtsi_interface_.reset();
+
+    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "System successfully stopped");
 
     return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -561,8 +583,8 @@ bool EliteCSPositionHardwareInterface::rtsiInit(const std::string& output_file, 
  */
 bool EliteCSPositionHardwareInterface::reconnectAll() {
     const std::string robot_ip = info_.hardware_parameters.at("robot_ip");
-    const std::string out_file  = info_.hardware_parameters.at("output_recipe_filename");
-    const std::string in_file   = info_.hardware_parameters.at("input_recipe_filename");
+    const std::string out_file = info_.hardware_parameters.at("output_recipe_filename");
+    const std::string in_file  = info_.hardware_parameters.at("input_recipe_filename");
 
     // Verbose "disconnecting / reconnecting" entry logs are omitted here — the caller
     // (updateAsyncIO) already logs the attempt at the throttled cadence. Only failures
@@ -577,9 +599,24 @@ bool EliteCSPositionHardwareInterface::reconnectAll() {
     rtsi_out_recipe_.reset();
     rtsi_in_recipe_.reset();
 
-    rclcpp::sleep_for(std::chrono::milliseconds(500));
+    // Brief pause before reconnect attempt. Poll in 5 ms ticks rather than one long
+    // sleep so on_cleanup()'s alive_=false signal is caught within one tick interval.
+    for (int i = 0; i < 100
+                    && async_thread_alive_.load()
+                    && rclcpp::ok(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    // Exit if alive_ was cleared by on_cleanup(), or the ROS2 context was torn down.
+    if (!async_thread_alive_.load() || !rclcpp::ok()) {
+        rtsi_reconnecting_.store(false);
+        return false;
+    }
 
     try {
+        if (!rclcpp::ok()) {
+            rtsi_reconnecting_.store(false);
+            return false;
+        }
         rtsi_interface_ = std::make_unique<ELITE::RtsiClientInterface>();
 
         if (!rtsi_interface_->connect(robot_ip)) {
@@ -618,6 +655,13 @@ bool EliteCSPositionHardwareInterface::reconnectAll() {
     }
 
     if (!eli_driver_->isRobotConnected()) {
+        // Guard: do not call connect() if the ROS2 context is gone. stopControl() closes
+        // the reverse/trajectory/script-command ports; eli_driver_ will report
+        // !isRobotConnected(), but calling connect() here would resend the ExternalControl
+        // script to an arm that was just cleanly stopped.
+        if (!rclcpp::ok()) {
+            return false;
+        }
         if (!eli_driver_->connect()) {
             if (should_log) {
                 RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
@@ -625,7 +669,6 @@ bool EliteCSPositionHardwareInterface::reconnectAll() {
                 reconnect_log_time_ = now;
             }
         } else {
-            // Success — always log immediately regardless of throttle gate.
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                 "reconnectAll: EliteDriver control channel reconnected");
         }
@@ -637,10 +680,13 @@ bool EliteCSPositionHardwareInterface::reconnectAll() {
 /**
  * Background thread body. Drives async IO and post-interruption reconnection.
  *
- * Resilience: both std::exception and unknown exceptions are caught around
- * updateAsyncIO() so that any error from IO or reconnection logic cannot
- * terminate the thread. Exceptions are logged at most once per 5 seconds via
- * async_exception_log_time_ to prevent log flooding during extended outages.
+ * Runs until on_cleanup() clears async_thread_alive_ and joins. on_cleanup() then
+ * calls stopControl() in the main thread after the join returns, ensuring no race
+ * between the async IO path and the stop signal.
+ *
+ * Resilience: both std::exception and unknown exceptions are caught around updateAsyncIO()
+ * so that any error from IO or reconnection logic cannot terminate the thread silently.
+ * Exceptions are logged at most once per kLogThrottleSeconds to prevent log flooding.
  */
 void EliteCSPositionHardwareInterface::asyncThread() {
     while (async_thread_alive_.load()) {
@@ -661,7 +707,9 @@ void EliteCSPositionHardwareInterface::asyncThread() {
                 async_exception_log_time_ = now;
             }
         }
-        std::this_thread::sleep_for(40000000ns);
+        for (int i = 0; i < 8 && async_thread_alive_.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
     }
 }
 
@@ -1143,6 +1191,9 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
     // Handle pending reconnection before doing any IO.
     // Always return early while reconnection is pending — rtsi_interface_ may be null.
     if (reconnection_needed_.load()) {
+        if (!rclcpp::ok()) {
+            return;
+        }
         if (!reconnect_failed_.load()) {
             auto now = std::chrono::steady_clock::now();
 
@@ -1164,6 +1215,9 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
                     RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                         "Reconnection attempt (%.0f/%.0f s elapsed)...", elapsed, connect_grace_period_s_);
                     reconnect_log_time_ = now;
+                }
+                if (!rclcpp::ok()) {
+                    return;
                 }
                 if (reconnectAll()) {
                     auto now_succ = std::chrono::steady_clock::now();
