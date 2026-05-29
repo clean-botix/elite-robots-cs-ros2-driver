@@ -169,6 +169,11 @@ ament_target_dependencies(
   controller_manager
   rclcpp
 )
+target_include_directories(
+  eli_ros2_control_node
+  PRIVATE
+  include
+)
 install(
   TARGETS eli_ros2_control_node
   DESTINATION lib/${PROJECT_NAME}
