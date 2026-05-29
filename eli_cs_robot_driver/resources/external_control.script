@@ -58,6 +58,8 @@ global steptime
 global trajectory_point_num
 global cmd_servo_joints
 
+textmsg("ExternalControl: Script started")
+
 def trajectoryThread():
     global trajectory_point_num
     blend_radius = int()
@@ -231,6 +233,10 @@ while control_mode > MODE_STOPPED:
             elif control_mode == MODE_SERVOJ:
                 cmd_servo_joints = get_actual_joint_positions()
                 move_thread_handle = start_thread(servoThread, ())
+            
+            # Log when a script stop is commanded externally
+            elif control_mode == MODE_STOPPED:
+                textmsg("ExternalControl: Script stopped")
             
         # Update the motion commands with new parameters
         if control_mode == MODE_SERVOJ:
