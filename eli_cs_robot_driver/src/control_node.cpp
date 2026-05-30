@@ -18,11 +18,13 @@
 
 std::atomic<int> exit_code{0};
 
-void signal_handler(int /*signal*/) {
+void signal_handler(int signal) {
     // SIGUSR1 is our custom error-exit signal. Only set the exit code here.
     // rclcpp::shutdown() is not async-signal-safe and must not be called from a signal handler.
     // The control loop calls it directly after detecting the error (std::raise returns synchronously).
-    exit_code = 1;
+    if (signal == SIGUSR1) {
+        exit_code = 1;
+    }
 }
 
 int main(int argc, char** argv) {
