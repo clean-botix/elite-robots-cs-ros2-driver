@@ -208,6 +208,12 @@ protected:
     double zero_ftsensor_cmd_;
     double zero_ftsensor_async_success_;
 
+    // Initial startup: true from on_configure() until the external control script is
+    // confirmed running for the first time. Cleared permanently in read() when
+    // runtime_state_ first reaches PLAYING. Never reset by reconnection logic.
+    bool initial_script_needed_{ false };
+    std::chrono::steady_clock::time_point initial_script_send_attempt_time_{};
+
     // Freedrive interface values
     bool freedrive_activated_;
     bool freedrive_controller_running_;

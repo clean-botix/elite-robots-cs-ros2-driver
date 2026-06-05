@@ -342,6 +342,7 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
     freedrive_controller_running_ = false;
     freedrive_activated_ = false;
     controllers_initialized_ = false;
+    initial_script_needed_ = false;
     stop_modes_.clear();
     start_modes_.clear();
 
@@ -464,6 +465,9 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
 
     // Timeout before the reverse interface will be dropped by the robot
     recv_timeout_ = std::stof(info_.hardware_parameters["robot_receive_timeout"]);
+
+    initial_script_needed_ = true;
+    initial_script_send_attempt_time_ = {};
 
     async_thread_alive_.store(true);
     async_thread_ = std::make_unique<std::thread>([&]() { asyncThread(); });
@@ -853,8 +857,13 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
                     "Robot left RUNNING mode -> now %s",
                     robotModeToString(robot_mode_copy_));
             } else if (robot_mode_copy_ == ELITE::RobotMode::RUNNING) {
-                RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-                    "Robot returned to RUNNING mode — external control may resume");
+                if (initial_script_needed_) {
+                    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                        "Robot is now in RUNNING mode — sending initial external control script");
+                } else {
+                    RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                        "Robot returned to RUNNING mode — external control may resume");
+                }
             }
         }
         prev_robot_mode_ = robot_mode_copy_;
@@ -888,6 +897,13 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
                 "EliteScript task is now EXECUTING");
         }
         prev_runtime_state_ = runtime_state_;
+    }
+
+    // Latch off the initial-send guard the first time the script is confirmed running.
+    if (initial_script_needed_ && runtime_state_ == ELITE::TaskStatus::PLAYING) {
+        initial_script_needed_ = false;
+        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+            "External control script confirmed running — initial auto-send deactivated");
     }
 
     uint32_t analog_types = 0;
@@ -1232,6 +1248,25 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
             }
         }
         return;
+    }
+
+    // Send the external control script for the first time if the arm wasn't able to
+    // receive it when on_configure() connected (e.g. robot was not yet in RUNNING mode).
+    // initial_script_needed_ is cleared permanently in read() the first time
+    // runtime_state_ reaches PLAYING, so this block is a no-op after that point.
+    if (initial_script_needed_ && eli_driver_ != nullptr &&
+        robot_mode_copy_ == ELITE::RobotMode::RUNNING &&
+        runtime_state_ != ELITE::TaskStatus::PLAYING) {
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - initial_script_send_attempt_time_).count() >= connect_retry_interval_s_) {
+            initial_script_send_attempt_time_ = now;
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "Arm is ready — sending initial external control script");
+            if (!eli_driver_->sendExternalControlScript()) {
+                RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "Initial external control script send failed — will retry when arm is ready");
+            }
+        }
     }
 
     bool is_io_update = false;
