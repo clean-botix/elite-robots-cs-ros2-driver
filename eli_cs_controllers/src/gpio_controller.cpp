@@ -403,7 +403,12 @@ bool GPIOController::setSpeedSlider(eli_common_interface::srv::SetSpeedSliderFra
                         "Could not verify that target speed fraction was set. (This might happen "
                         "when using the mocked interface)");
         }
-        resp->success = static_cast<bool>(command_interfaces_[(int)CommandOffset::TARGET_SPEED_FRACTION_SUCCESS].get_value());
+        resp->success =
+            command_interfaces_[(int)CommandOffset::TARGET_SPEED_FRACTION_SUCCESS].get_value() == 1.0;
+        if (!resp->success) {
+            RCLCPP_ERROR(get_node()->get_logger(), "Could not set speed slider fraction");
+            return false;
+        }
     } else {
         RCLCPP_WARN(get_node()->get_logger(),
                     "The desired speed slider fraction must be within range (0; 1.0]. Request "

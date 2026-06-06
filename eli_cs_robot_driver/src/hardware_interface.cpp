@@ -1280,10 +1280,13 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
         io_async_success_ = true;
     }
 
+    bool speed_slider_pending = false;
     if (!std::isnan(target_speed_fraction_cmd_) && rtsi_interface_ != nullptr) {
         if (rtsi_in_recipe_->setValue("speed_slider_mask", (int)1) &&
             rtsi_in_recipe_->setValue("speed_slider_fraction", target_speed_fraction_cmd_)) {
-            scaling_async_success_ = true;
+            speed_slider_pending = true;
+        } else {
+            scaling_async_success_ = false;
         }
         target_speed_fraction_cmd_ = NO_NEW_CMD;
     }
@@ -1387,6 +1390,11 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
 
     if (rtsi_interface_->isConnected()) {
         rtsi_interface_->send(rtsi_in_recipe_);
+        if (speed_slider_pending) {
+            scaling_async_success_ = true;
+        }
+    } else if (speed_slider_pending) {
+        scaling_async_success_ = false;
     }
 }
 
