@@ -235,6 +235,7 @@ forward_velocity_controller:
 io_and_status_controller:
   ros__parameters:
     tf_prefix: "$(var tf_prefix)"
+    check_io_successfull_retries: 200
 
 speed_scaling_state_broadcaster:
   ros__parameters:

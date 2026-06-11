@@ -2,8 +2,11 @@
 #include <thread>
 #include <csignal>
 
-#include <controller_manager/controller_manager.hpp>
 #include <rclcpp/rclcpp.hpp>
+
+// Rely on a subclass of ControllerManager to intercept the pre-shutdown hook
+// and execute a workaround for a ROS2 Humble bug to ensure orderly shutdown at termination.
+#include "eli_cs_robot_driver/elite_controller_manager.hpp"
 
 // This include directive triggers a compilation warning to use <realtime_tools/realtime_helpers.hpp> instead.
 // However, while that change is a drop-in replacement that clears the warning, something about it introduces
@@ -16,29 +19,37 @@
 std::atomic<int> exit_code{0};
 
 void signal_handler(int signal) {
-    // We're using SIGUSR1 as our custom error signal
+    // SIGUSR1 is our custom error-exit signal. Only set the exit code here.
+    // rclcpp::shutdown() is not async-signal-safe and must not be called from a signal handler.
+    // The control loop calls it directly after detecting the error (std::raise returns synchronously).
     if (signal == SIGUSR1) {
         exit_code = 1;
     }
-    rclcpp::shutdown();
 }
 
 int main(int argc, char** argv) {
-    // Register signal handler
+    // Only register a handler for our custom error signal. SIGINT and SIGTERM
+    // are left to rclcpp::init()'s safe handlers — overriding them here and
+    // calling rclcpp::shutdown() from signal context would be unsafe
+    // (not async-signal-safe) and can crash MultiThreadedExecutor.
     std::signal(SIGUSR1, signal_handler);
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
+
+    std::set_terminate([]() {
+        fprintf(stderr, "[ControllerManager] ignoring terminate() -- likely CM shutdown race in ROS2 Humble\n");
+        _exit(0); // clean exit code, no core dump
+    });
 
     rclcpp::init(argc, argv);
+    rclcpp::install_signal_handlers(); // Ensures SIGINT and SIGTERM handled
 
     // Create Executor
     std::shared_ptr<rclcpp::Executor> executor = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
     // Create Controller Manager
-    std::shared_ptr<controller_manager::ControllerManager> controller_manager;
+    std::shared_ptr<ELITE_CS_ROBOT_ROS_DRIVER::EliteControllerManager> controller_manager;
 
     try {
         // create controller manager instance
-        controller_manager = std::make_shared<controller_manager::ControllerManager>(executor, "controller_manager");
+        controller_manager = std::make_shared<ELITE_CS_ROBOT_ROS_DRIVER::EliteControllerManager>(executor, "controller_manager");
     } catch (const std::exception& ex) {
         RCLCPP_FATAL(
             rclcpp::get_logger("controller_manager"),
@@ -51,6 +62,10 @@ int main(int argc, char** argv) {
         rclcpp::shutdown();
         return 1;
     }
+
+    // Add node before starting the control loop thread.
+    // controller_manager->now() requires the node to be associated with an executor.
+    executor->add_node(controller_manager);
 
     // Control loop thread
     std::thread control_loop([controller_manager]() {
@@ -99,27 +114,30 @@ int main(int argc, char** argv) {
         }
     });
 
-    // spin the executor with controller manager node
-    executor->add_node(controller_manager);
-
     try {
         executor->spin();
-        
     } catch (const std::exception& ex) {
+        exit_code = 1;
         RCLCPP_FATAL(
             rclcpp::get_logger("main"),
             "Exception in executor: %s", ex.what()
         );
-        exit_code = 1;
-        rclcpp::shutdown();
     } catch (...) {
-        RCLCPP_FATAL(rclcpp::get_logger("main"), "Unknown exception in executor");
         exit_code = 1;
-        rclcpp::shutdown();
+        RCLCPP_FATAL(
+            rclcpp::get_logger("main"),
+            "Unknown exception in executor");
     }
 
     // Wait for control loop to finish
     control_loop.join();
+
+    try {
+        rclcpp::shutdown();
+    } catch (const std::exception & e) {
+        exit_code = 1;
+        fprintf(stderr, "Caught exception during rclcpp::shutdown: %s\n", e.what());
+    }
 
     return exit_code;
 }

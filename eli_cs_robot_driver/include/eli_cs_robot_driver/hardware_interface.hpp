@@ -3,6 +3,8 @@
 
 // System
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <string>
@@ -21,6 +23,7 @@
 #include <hardware_interface/system_interface.hpp>
 #include <hardware_interface/types/hardware_interface_return_values.hpp>
 
+#include <Elite/DataType.hpp>
 #include <Elite/EliteDriver.hpp>
 #include <Elite/RtsiClientInterface.hpp>
 
@@ -32,6 +35,33 @@ constexpr char ELITE_HW_IF_FREEDRIVE[] = "freedrive_mode";
 /**
  * @brief Handles the interface between the ROS system and the main driver.
  *
+ * Resilience mechanisms implemented in this class:
+ *
+ * Lifecycle idempotency: on_configure() may be called multiple times by the
+ * controller_manager (e.g. after read() returns ERROR). A cleanup block at the
+ * start of on_configure() tears down all resources — async thread, RTSI session,
+ * EliteDriver, controller-mode tracking state — before rebuilding them, preventing
+ * port-binding failures and stale controller state on re-entry.
+ *
+ * Post-interruption reconnection: when read() detects a failed RTSI receive, it
+ * arms a reconnection state machine (reconnection_needed_, reconnect_start_time_).
+ * The async thread drives fixed-interval reconnection attempts via reconnectAll()
+ * for up to connect_grace_period_s_ seconds. If the grace period expires,
+ * reconnect_failed_ is set and read() returns ERROR on its next invocation.
+ *
+ * Thread-safe RTSI teardown: rtsi_reconnecting_ guards read() from calling
+ * receiveData() while reconnectAll() is tearing down or rebuilding the RTSI
+ * interface. On every reconnectAll() failure path, rtsi_interface_ is reset
+ * before rtsi_reconnecting_ is cleared, so read()'s null-guard always sees a
+ * null pointer before it can observe the cleared flag.
+ *
+ * Mode transition logging: robot_mode_copy_ and safety_mode_copy_ track the
+ * arm's operating mode across read() cycles and emit human-readable log messages
+ * whenever a transition occurs, providing clear indicators of power cycles,
+ * e-stops, protective stops, and remote/local mode switches.
+ *
+ * Log throttling: write failures, async-thread exceptions, and RTSI reconnection
+ * messages are gated to at most one log entry per 5 seconds.
  */
 class EliteCSPositionHardwareInterface : public hardware_interface::SystemInterface {
 public:
@@ -63,8 +93,38 @@ protected:
     ELITE::RtsiRecipeSharedPtr rtsi_out_recipe_;
     ELITE::RtsiRecipeSharedPtr rtsi_in_recipe_;
     std::unique_ptr<std::thread> async_thread_;
-    bool async_thread_alive_;
+    std::atomic<bool> async_thread_alive_{ false };
+
+    // Post-interruption reconnection state machine.
+    // reconnection_needed_: armed by read() when receiveData() fails; drives updateAsyncIO().
+    // reconnect_failed_: set by updateAsyncIO() when the grace period expires; read() returns ERROR.
+    // rtsi_reconnecting_: guards read() from calling receiveData() during RTSI teardown/rebuild.
+    // Ordering invariant: rtsi_interface_ must be reset BEFORE rtsi_reconnecting_ is cleared
+    // so read()'s null-guard observes null before it observes the cleared flag.
+    std::atomic<bool> reconnection_needed_{ false };
+    std::atomic<bool> reconnect_failed_{ false };
+    std::chrono::steady_clock::time_point reconnect_start_time_;
+    std::chrono::steady_clock::time_point reconnect_last_attempt_time_{};
+    std::atomic<bool> rtsi_reconnecting_{ false };
+    // Standard throttle interval (s) for all repeated log messages. One log per this many
+    // seconds prevents flooding during extended connection outages or write failures.
+    static constexpr double kLogThrottleSeconds = 10.0;
+
+    // Log throttle gates — each caps its message category to 1 per kLogThrottleSeconds.
+    std::chrono::steady_clock::time_point async_exception_log_time_{};
+    std::chrono::steady_clock::time_point write_failure_log_time_{};
+    std::chrono::steady_clock::time_point reconnect_log_time_{};    // all reconnection-family logs (consolidated)
+
+    // Connection timing — both startup loops and post-interruption retries use these values.
+    // Sourced from URDF hardware parameters connect_grace_period_s / connect_retry_interval_s.
+    double connect_grace_period_s_{ 30.0 };
+    double connect_retry_interval_s_{ 2.0 };
+
+    // Robot mode tracking for logging transitions
+    ELITE::RobotMode  prev_robot_mode_{ ELITE::RobotMode::UNKNOWN };
+    ELITE::SafetyMode prev_safety_mode_{ ELITE::SafetyMode::UNKNOWN };
     ELITE::TaskStatus runtime_state_;
+    ELITE::TaskStatus prev_runtime_state_{ ELITE::TaskStatus::UNKNOWN };
     // resources switching aux vars
     std::vector<std::vector<std::string>> stop_modes_;
     std::vector<std::vector<std::string>> start_modes_;
@@ -119,8 +179,10 @@ protected:
 
     double tool_analog_input_type_copy_;
     double tool_analog_output_type_copy_;
-    double robot_mode_copy_;
-    double safety_mode_copy_;
+    ELITE::RobotMode  robot_mode_copy_{ ELITE::RobotMode::UNKNOWN };
+    ELITE::SafetyMode safety_mode_copy_{ ELITE::SafetyMode::UNKNOWN };
+    double robot_mode_iface_{ 0.0 };   // double proxy for StateInterface binding only
+    double safety_mode_iface_{ 0.0 };  // double proxy for StateInterface binding only
     double tool_mode_copy_;
     double system_interface_initialized_;
     double robot_task_running_copy_;
@@ -146,6 +208,12 @@ protected:
     double zero_ftsensor_cmd_;
     double zero_ftsensor_async_success_;
 
+    // Initial startup: true from on_configure() until the external control script is
+    // confirmed running for the first time. Cleared permanently in read() when
+    // runtime_state_ first reaches PLAYING. Never reset by reconnection logic.
+    bool initial_script_needed_{ false };
+    std::chrono::steady_clock::time_point initial_script_send_attempt_time_{};
+
     // Freedrive interface values
     bool freedrive_activated_;
     bool freedrive_controller_running_;
@@ -161,6 +229,7 @@ protected:
     bool timeoutExpired(std::chrono::time_point<std::chrono::steady_clock>, int);
     void asyncThread();
     void updateAsyncIO();
+    bool reconnectAll();
     bool updateStandardIO(bool* is_update);
     bool updateConfigIO(bool* is_update);
     bool updateToolDigital(bool* is_update);
@@ -171,6 +240,9 @@ protected:
     void transformForceTorque();
     bool rtsiInit(const std::string& output_file, const std::string& input_file);
     std::vector<std::string> readRecipe(const std::string& recipe_file);
+
+    static const char* robotModeToString(ELITE::RobotMode mode);
+    static const char* safetyModeToString(ELITE::SafetyMode mode);
 
     template <const char*... Args>
     bool containsAnyOfString(const std::vector<std::string>& input) {

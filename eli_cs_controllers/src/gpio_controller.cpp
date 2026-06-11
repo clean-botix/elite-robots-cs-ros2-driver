@@ -1,6 +1,8 @@
 #include "eli_cs_controllers/gpio_controller.hpp"
 
+#include <chrono>
 #include <string>
+#include <thread>
 
 namespace ELITE_CS_CONTROLLER {
 controller_interface::CallbackReturn GPIOController::on_init() {
@@ -401,7 +403,12 @@ bool GPIOController::setSpeedSlider(eli_common_interface::srv::SetSpeedSliderFra
                         "Could not verify that target speed fraction was set. (This might happen "
                         "when using the mocked interface)");
         }
-        resp->success = static_cast<bool>(command_interfaces_[(int)CommandOffset::TARGET_SPEED_FRACTION_SUCCESS].get_value());
+        resp->success =
+            command_interfaces_[(int)CommandOffset::TARGET_SPEED_FRACTION_SUCCESS].get_value() == 1.0;
+        if (!resp->success) {
+            RCLCPP_ERROR(get_node()->get_logger(), "Could not set speed slider fraction");
+            return false;
+        }
     } else {
         RCLCPP_WARN(get_node()->get_logger(),
                     "The desired speed slider fraction must be within range (0; 1.0]. Request "
@@ -414,26 +421,67 @@ bool GPIOController::setSpeedSlider(eli_common_interface::srv::SetSpeedSliderFra
 
 bool GPIOController::resendRobotControlScript(std_srvs::srv::Trigger::Request::SharedPtr /*req*/,
                                         std_srvs::srv::Trigger::Response::SharedPtr resp) {
-    // reset success flag
+    // Trigger hardware-level stop + script resend.
     command_interfaces_[(int)CommandOffset::RESEND_ROBOT_CONTROL_SCRIPT_SUCCESS].set_value(ASYNC_WAITING);
-    // call the service in the hardware
     command_interfaces_[(int)CommandOffset::RESEND_ROBOT_CONTROL_SCRIPT].set_value(1.0);
 
+    // Wait for the hardware to complete socket delivery (covers stop-wait up to 5 s + send).
     if (!waitForAsyncCommand(
             [&]() { return command_interfaces_[(int)CommandOffset::RESEND_ROBOT_CONTROL_SCRIPT_SUCCESS].get_value(); })) {
         RCLCPP_WARN(get_node()->get_logger(),
                     "Could not verify that program was sent. (This might happen when using the "
                     "mocked interface)");
     }
-    resp->success = static_cast<bool>(command_interfaces_[(int)CommandOffset::RESEND_ROBOT_CONTROL_SCRIPT_SUCCESS].get_value());
 
-    if (resp->success) {
-        RCLCPP_INFO(get_node()->get_logger(), "Successfully resent robot program");
-    } else {
-        RCLCPP_ERROR(get_node()->get_logger(), "Could not resend robot program");
+    if (!static_cast<bool>(command_interfaces_[(int)CommandOffset::RESEND_ROBOT_CONTROL_SCRIPT_SUCCESS].get_value())) {
+        RCLCPP_ERROR(get_node()->get_logger(), "External control script failed network socket delivery to arm controller");
+        resp->success = false;
         return false;
     }
 
+    // Phase 1: Wait for the EliteScript task to enter EXECUTING state.
+    // The task can fail immediately after socket delivery due to safety states, wrong
+    // robot mode, or a script error — socket delivery success does not guarantee execution.
+    constexpr int TASK_START_TIMEOUT_MS = 2000;
+    constexpr int TASK_STABLE_DWELL_MS = 500;
+    constexpr int POLL_INTERVAL_MS = 50;
+    auto phase_start = std::chrono::steady_clock::now();
+
+    while (state_interfaces_[(int)StateOffset::TASK_RUNNING].get_value() != 1.0) {
+        // Abort on shutdown: hardware interface is shutting down; state will not update.
+        if (!rclcpp::ok()) { resp->success = false; return false; }
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - phase_start).count() > TASK_START_TIMEOUT_MS) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                "EliteScript task did not enter EXECUTING state within %d ms — "
+                "task may have failed",
+                TASK_START_TIMEOUT_MS);
+            resp->success = false;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(POLL_INTERVAL_MS));
+    }
+
+    // Phase 2: Brief inspection dwell — confirm the task remains EXECUTING and did not
+    // immediately crash after startup.
+    auto dwell_start = std::chrono::steady_clock::now();
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - dwell_start).count() < TASK_STABLE_DWELL_MS) {
+        // Abort on shutdown: no point confirming task stability during driver teardown.
+        if (!rclcpp::ok()) { resp->success = false; return false; }
+        if (state_interfaces_[(int)StateOffset::TASK_RUNNING].get_value() != 1.0) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                "EliteScript task entered EXECUTING state but then stopped — "
+                "task may have crashed");
+            resp->success = false;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(POLL_INTERVAL_MS));
+    }
+
+    RCLCPP_INFO(get_node()->get_logger(),
+        "EliteScript task confirmed EXECUTING — robot program successfully started");
+    resp->success = true;
     return true;
 }
 
@@ -530,6 +578,10 @@ bool GPIOController::waitForAsyncCommand(std::function<double(void)> get_value) 
     const auto maximum_retries = params_.check_io_successfull_retries;
     int retries = 0;
     while (get_value() == ASYNC_WAITING) {
+        // Abort if ROS2 is shutting down: the hardware interface async thread that
+        // processes commands has already exited, so the command will never complete.
+        // Without this check the executor's spin() cannot return, blocking on_cleanup().
+        if (!rclcpp::ok()) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         retries++;
 

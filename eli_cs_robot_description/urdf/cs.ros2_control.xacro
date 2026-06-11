@@ -16,7 +16,6 @@
     tf_prefix
     robot_ip
     local_ip:=0.0.0.0
-    robot_connect_timeout:=10
     robot_receive_timeout:=0.2
     servoj_gain:=1000
     servoj_lookahead_time:=0.32
@@ -30,6 +29,8 @@
     script_sender_port:=50002
     script_command_port:=50004
     trajectory_port:=50003
+    connect_grace_period_s:=30.0
+    connect_retry_interval_s:=2.0
     ">
 
     <ros2_control name="${name}" type="system">
@@ -49,7 +50,6 @@
           <plugin>ELITE_CS_ROBOT_ROS_DRIVER/EliteCSPositionHardwareInterface</plugin>
           <param name="robot_ip">${robot_ip}</param>
           <param name="local_ip">${local_ip}</param>
-          <param name="robot_connect_timeout">${robot_connect_timeout}</param>
           <param name="robot_receive_timeout">${robot_receive_timeout}</param>
           <param name="servoj_gain">${servoj_gain}</param>
           <param name="servoj_lookahead_time">${servoj_lookahead_time}</param>
@@ -69,6 +69,8 @@
           <param name="tool_baud_rate">${tool_baud_rate}</param>
           <param name="tool_stop_bits">${tool_stop_bits}</param>
           <param name="tool_tcp_port">${tool_tcp_port}</param>
+          <param name="connect_grace_period_s">${connect_grace_period_s}</param>
+          <param name="connect_retry_interval_s">${connect_retry_interval_s}</param>
         </xacro:unless>
       </hardware>
       <joint name="${tf_prefix}shoulder_pan_joint">
