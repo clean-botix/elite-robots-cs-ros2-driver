@@ -178,6 +178,10 @@ def scriptCommands():
 
 
 # NODE_CONTROL_LOOP_BEGINS
+textmsg("Reverse connection {{SERVER_IP_REPLACE}}:{{REVERSE_PORT_REPLACE}}...")
+textmsg("Trajectory connection {{SERVER_IP_REPLACE}}:{{TRAJECTORY_SERVER_PORT_REPLACE}}...")
+textmsg("Script command connection {{SERVER_IP_REPLACE}}:{{SCRIPT_COMMAND_PORT_REPLACE}}...")
+
 socket_open("{{SERVER_IP_REPLACE}}", {{REVERSE_PORT_REPLACE}}, "reverse_socket")
 socket_open("{{SERVER_IP_REPLACE}}", {{TRAJECTORY_SERVER_PORT_REPLACE}}, "trajectory_socket")
 socket_open("{{SERVER_IP_REPLACE}}", {{SCRIPT_COMMAND_PORT_REPLACE}}, "script_command_socket")
