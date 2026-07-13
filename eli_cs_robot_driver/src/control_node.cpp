@@ -1,6 +1,10 @@
 #include <memory>
 #include <thread>
 #include <csignal>
+#include <cerrno>
+#include <cstring>
+
+#include <sys/mman.h>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -71,6 +75,18 @@ int main(int argc, char** argv) {
     std::thread control_loop([controller_manager]() {
         if (!realtime_tools::configure_sched_fifo(50)) {
             RCLCPP_WARN(controller_manager->get_logger(), "Could not enable FIFO RT scheduling policy");
+        }
+
+        // Lock all current and future pages in RAM: a page fault in this thread
+        // blocks on the kernel mm subsystem (possibly I/O) for tens to hundreds
+        // of ms, which RT priority does not prevent — long enough to starve the
+        // cyclic bus update (e.g. EtherCAT slave SM watchdogs). Requires the
+        // container to grant a sufficient memlock ulimit; warn-and-continue so a
+        // missing ulimit degrades RT behavior instead of preventing startup.
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+            RCLCPP_WARN(controller_manager->get_logger(),
+                "mlockall failed (%s) — control thread may page-fault under memory pressure",
+                std::strerror(errno));
         }
 
         // for calculating sleep time
