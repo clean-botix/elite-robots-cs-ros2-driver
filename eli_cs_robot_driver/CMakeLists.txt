@@ -221,6 +221,11 @@ if(BUILD_TESTING)
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  # Unit tests for the ROS-free real-time memory helpers (rt_memory.hpp).
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_rt_memory test/test_rt_memory.cpp)
+  target_include_directories(test_rt_memory PRIVATE include)
 endif()
 
 ament_package()
