@@ -1,8 +1,9 @@
-// Unit tests for the real-time memory helpers used by the control node.
-// These exercise the pure policy/formatting logic extracted from control_node.cpp
+// Unit tests for the pure real-time memory helpers in rt_memory.hpp
 // (RLIMIT_MEMLOCK formatting, std::terminate classification, and the heap
-// pre-fault smoke path); the glibc-only mlockall()/mallopt() wiring is not
-// covered here as it requires the deployed container environment.
+// pre-fault smoke path). The effectful orchestration in rt_memory.cpp
+// (configure_realtime_memory's mlockall()/mallopt()/logging) is not covered here
+// as it requires the deployed container environment; these tests link only the
+// header, not rclcpp.
 #include <exception>
 #include <stdexcept>
 #include <string>

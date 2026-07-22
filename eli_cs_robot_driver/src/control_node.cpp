@@ -1,22 +1,16 @@
 #include <memory>
 #include <thread>
 #include <csignal>
-#include <cerrno>
-#include <cstring>
 #include <cstdio>
 #include <exception>
-#include <string>
 
-#include <malloc.h>
-#include <sys/mman.h>
-#include <sys/resource.h>
 #include <unistd.h>
 
 #include <rclcpp/rclcpp.hpp>
 
-// ROS-free real-time memory helpers (describe_rlimit, classify_terminate,
-// reserve_process_memory). Kept in a header so they are unit-tested directly;
-// see test/test_rt_memory.cpp.
+// Real-time memory helpers: pure, unit-tested policy (classify_terminate) plus
+// configure_realtime_memory(), which does the mlockall()/mallopt()/logging setup.
+// See rt_memory.hpp / rt_memory.cpp and test/test_rt_memory.cpp.
 #include "eli_cs_robot_driver/rt_memory.hpp"
 
 // Rely on a subclass of ControllerManager to intercept the pre-shutdown hook
@@ -41,11 +35,6 @@ void signal_handler(int signal) {
         exit_code = 1;
     }
 }
-
-// Conservative heap headroom to pre-fault before entering the RT loop. With
-// glibc M_TRIM_THRESHOLD=-1 in effect this becomes a permanent RSS floor, so it
-// is sized as headroom over the measured footprint; tune with monitoring (SW-933).
-static constexpr size_t kHeapReserveBytes = 100UL * 1024 * 1024; // 100 MiB
 
 int main(int argc, char** argv) {
     // Only register a handler for our custom error signal. SIGINT and SIGTERM
@@ -114,46 +103,10 @@ int main(int argc, char** argv) {
             RCLCPP_WARN(controller_manager->get_logger(), "Could not enable FIFO RT scheduling policy");
         }
 
-        // Log the memlock rlimit this process is working with, so a later
-        // memory-exhaustion condition is diagnosable and an absent/insufficient
-        // ulimit is obvious in the logs (mlockall below silently fails without it).
-        namespace rt = ELITE_CS_ROBOT_ROS_DRIVER::rt_memory;
-        struct rlimit memlock_limit{};
-        if (getrlimit(RLIMIT_MEMLOCK, &memlock_limit) == 0) {
-            RCLCPP_INFO(controller_manager->get_logger(),
-                "RLIMIT_MEMLOCK: soft=%s hard=%s",
-                rt::describe_rlimit(memlock_limit.rlim_cur).c_str(),
-                rt::describe_rlimit(memlock_limit.rlim_max).c_str());
-        }
-
-        // Lock all of this PROCESS's current and future pages in RAM. mlockall is
-        // process-scoped, not thread-scoped, even though it is called here from
-        // the control thread: a page fault in the RT control thread blocks on the
-        // kernel mm subsystem (possibly I/O) for tens to hundreds of ms, which RT
-        // priority does not prevent — long enough to starve the cyclic bus update
-        // (e.g. EtherCAT slave SM watchdogs). Requires the container to grant a
-        // sufficient memlock ulimit (the deployed compose sets ulimits.memlock =
-        // -1); warn-and-continue so a missing ulimit degrades RT behavior instead
-        // of preventing startup.
-        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-            RCLCPP_WARN(controller_manager->get_logger(),
-                "mlockall failed (%s) — control thread may page-fault under memory pressure",
-                std::strerror(errno));
-        }
-
-        // Complement the lock so future allocations don't reintroduce page-fault
-        // stalls in the RT loop:
-        //   M_MMAP_MAX = 0       -> never service allocations via mmap (the mmap
-        //                           path faults page-by-page on first touch);
-        //                           heap growth goes through the main arena.
-        //   M_TRIM_THRESHOLD = -1 -> never return freed memory to the kernel, so
-        //                           it stays mapped (and locked) for later reuse.
-        mallopt(M_MMAP_MAX, 0);
-        mallopt(M_TRIM_THRESHOLD, -1);
-
-        // Front-load heap growth: fault in (and, via MCL_FUTURE, lock) a reserve
-        // now so the RT loop reuses already-resident pages instead of faulting.
-        rt::reserve_process_memory(kHeapReserveBytes);
+        // Lock the process into RAM and pre-fault a heap reserve so the RT loop
+        // doesn't page-fault under memory pressure (see rt_memory.cpp for the
+        // mlockall/mallopt/rlimit details).
+        ELITE_CS_ROBOT_ROS_DRIVER::rt_memory::configure_realtime_memory(controller_manager->get_logger());
 
         // for calculating sleep time
         auto const period = std::chrono::nanoseconds(1'000'000'000 / controller_manager->get_update_rate());

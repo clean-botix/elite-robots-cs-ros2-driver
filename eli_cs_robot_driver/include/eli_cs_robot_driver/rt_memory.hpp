@@ -1,9 +1,12 @@
 // Real-time memory helpers for the control node.
 //
-// The logic here is deliberately free of ROS/rclcpp and of any glibc-only calls
-// (mlockall/mallopt live in control_node.cpp) so it can be unit-tested on any
-// POSIX host. See src/control_node.cpp for how these are wired into startup and
-// the std::terminate handler.
+// The inline helpers here are deliberately free of ROS/rclcpp and of any
+// glibc-only calls, so they can be unit-tested on any POSIX host (see
+// test/test_rt_memory.cpp). The effectful orchestration that ties them together
+// with mlockall()/mallopt() and rclcpp logging lives in rt_memory.cpp behind
+// configure_realtime_memory(); rclcpp::Logger is only forward-declared here so
+// this header stays cheap to include and the pure helpers remain testable
+// without linking rclcpp.
 #pragma once
 
 #include <cstddef>
@@ -14,6 +17,10 @@
 
 #include <sys/resource.h>
 #include <unistd.h>
+
+namespace rclcpp {
+class Logger;
+}
 
 namespace ELITE_CS_ROBOT_ROS_DRIVER {
 namespace rt_memory {
@@ -81,6 +88,25 @@ inline void reserve_process_memory(std::size_t size) {
     }
     std::free(const_cast<char*>(buffer));
 }
+
+// Conservative heap headroom for reserve_process_memory() to pre-fault before
+// the RT loop. With glibc M_TRIM_THRESHOLD=-1 in effect this becomes a permanent
+// RSS floor, so it is sized as headroom over the measured footprint; tune with
+// monitoring (SW-933).
+inline constexpr std::size_t kDefaultHeapReserveBytes = 100UL * 1024 * 1024; // 100 MiB
+
+// Configure the process for real-time memory behavior, logging via `logger`:
+//   1. log the RLIMIT_MEMLOCK the process is working with (an absent/insufficient
+//      ulimit makes step 2 silently fail -- surfacing it is the point);
+//   2. mlockall(MCL_CURRENT | MCL_FUTURE) to keep every page resident (warn and
+//      continue on failure rather than block startup);
+//   3. mallopt() so future allocations don't reintroduce page-fault stalls;
+//   4. pre-fault `reserve_bytes` of heap so first-touch faults happen here.
+// Effectful and glibc/rclcpp-dependent, hence defined in rt_memory.cpp rather
+// than inline. Intended to be called once from the control loop thread, after
+// RT scheduling is configured. See src/control_node.cpp.
+void configure_realtime_memory(const rclcpp::Logger& logger,
+                               std::size_t reserve_bytes = kDefaultHeapReserveBytes);
 
 }  // namespace rt_memory
 }  // namespace ELITE_CS_ROBOT_ROS_DRIVER

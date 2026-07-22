@@ -163,6 +163,7 @@ install(
 add_executable(
   eli_ros2_control_node
   src/control_node.cpp
+  src/rt_memory.cpp
 )
 ament_target_dependencies(
   eli_ros2_control_node
