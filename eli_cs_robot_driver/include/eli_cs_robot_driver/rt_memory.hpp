@@ -112,23 +112,83 @@ inline std::string format_fault_report(long minor_delta, long major_delta,
     return std::string(buf);
 }
 
-// Default period between page-fault reports. Long enough to keep the logs quiet;
-// the RT concern is any nonzero major-fault rate at all, which shows up regardless.
-inline constexpr double kFaultLogIntervalSeconds = 30.0;
+// Parse a "Key:   <n> kB" entry from /proc/<pid>/status contents; returns n in
+// kB, or -1 if the key is absent. Pure/testable (feed it file contents).
+inline long parse_status_kb(const std::string& status, const char* key) {
+    const std::string needle = std::string(key) + ":";
+    std::size_t pos = status.find(needle);
+    if (pos == std::string::npos) {
+        return -1;
+    }
+    pos += needle.size();
+    long value = 0;
+    bool seen_digit = false;
+    for (; pos < status.size(); ++pos) {
+        const char c = status[pos];
+        if (c >= '0' && c <= '9') {
+            value = value * 10 + (c - '0');
+            seen_digit = true;
+        } else if (seen_digit || c == '\n') {
+            break;  // end of the number, or end of line with no number
+        }
+        // otherwise: skip leading whitespace before the number
+    }
+    return seen_digit ? value : -1;
+}
 
-// Periodically logs the calling (control) thread's page-fault counts via
-// getrusage(RUSAGE_THREAD), so fault activity is visible in normal container logs
-// without attaching perf/proc tooling. RT-friendly: call tick() once per loop
-// iteration; it is O(1) and only performs the getrusage syscall + a log line once
-// per log interval (gated by iteration count, so no per-iteration clock call).
-// The first tick establishes the baseline (after startup faulting) and logs
-// nothing. Defined in rt_memory.cpp (needs getrusage + rclcpp).
-class PageFaultMonitor {
+// Format the process memory-footprint line. Inputs are kB (as read from
+// /proc/<pid>/status); -1 renders as -1 (field unavailable). Pure/testable.
+// VmHWM (peak RSS) is the value to size the memlock ulimit cap from.
+inline std::string format_memory_report(long vmrss_kb, long vmlck_kb, long vmhwm_kb) {
+    auto to_mib = [](long kb) -> long { return kb < 0 ? -1 : kb / 1024; };
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "memory check (process): RSS=%ld MiB, locked=%ld MiB, peak RSS(VmHWM)=%ld MiB "
+        "-- size the memlock cap from the peak",
+        to_mib(vmrss_kb), to_mib(vmlck_kb), to_mib(vmhwm_kb));
+    return std::string(buf);
+}
+
+// Default period between monitor reports. Long enough to keep the logs quiet; the
+// RT concern is any nonzero major-fault rate at all, which shows up regardless.
+inline constexpr double kDefaultLogIntervalSeconds = 30.0;
+
+// Env var (read in control_node.cpp) that overrides the report interval in
+// seconds. A value <= 0 disables the monitor; absent/empty/invalid uses the
+// default above. Set it in the bot's .env (loaded into the container).
+inline constexpr const char* kLogIntervalEnvVar = "OPTIMUSCLEAN_DRIVERS_MEMORY_LOG_INTERVAL_SEC";
+
+// Parse a seconds value from an env-var string. Null/empty/non-numeric returns
+// `fallback`; a valid value (including <= 0, meaning "disabled") is returned as
+// parsed. Pure/testable.
+inline double parse_interval_seconds(const char* value, double fallback) {
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    if (end == value) {  // no digits consumed
+        return fallback;
+    }
+    return parsed;
+}
+
+// Periodically logs the calling (control) thread's page-fault counts (via
+// getrusage(RUSAGE_THREAD)) and the process memory footprint (VmRSS/VmLck/VmHWM
+// from /proc/self/status), so fault activity and the peak RSS needed to size the
+// memlock cap are visible in normal container logs without perf/proc tooling.
+// RT-friendly: call tick() once per loop iteration; it is O(1) and only does the
+// syscall/file read + log once per log interval (gated by iteration count, so no
+// per-iteration clock call). The first tick reports memory and establishes the
+// fault baseline. A log interval <= 0 disables it entirely (tick() is a no-op).
+// Defined in rt_memory.cpp (needs getrusage + rclcpp).
+class RtMemoryMonitor {
 public:
-    PageFaultMonitor(double loop_rate_hz, double log_interval_seconds = kFaultLogIntervalSeconds);
+    RtMemoryMonitor(double loop_rate_hz, double log_interval_seconds = kDefaultLogIntervalSeconds);
     void tick(const rclcpp::Logger& logger);
 
 private:
+    bool enabled_;
     long iters_per_log_;
     double interval_seconds_;
     long counter_ = 0;

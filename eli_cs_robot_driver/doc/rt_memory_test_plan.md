@@ -12,7 +12,8 @@ otherwise starve the cyclic EtherCAT update and trip slave SM watchdogs
 1. logs the `RLIMIT_MEMLOCK` it is running under,
 2. calls `mlockall(MCL_CURRENT | MCL_FUTURE)`,
 3. tunes glibc (`mallopt`) and pre-faults a heap reserve, and
-4. periodically logs the control thread's page-fault counts.
+4. periodically logs the control thread's page-fault counts and the process
+   memory footprint (RSS / locked / peak RSS).
 
 **Critical dependency:** `mlockall()` only succeeds if the container grants a
 sufficient `memlock` ulimit. The generated compose already grants
@@ -152,21 +153,52 @@ low — re-run after `ulimit -l unlimited`) or a nonzero fault count.
 
 ## Test 4 — Page-fault self-logging (ongoing observability)
 
-Validates the in-node monitor and gives the steady-state fault picture. The node
-logs a `page-fault check (control thread): ...` line every ~30 s.
+Validates the in-node monitor and gives the steady-state fault picture. Every
+~30 s the node logs a `memory check (process): ...` line and a
+`page-fault check (control thread): ...` line.
 
 Let the robot run and perform normal cyclic work (ideally the operation that
 historically threw the comm errors), then:
 
 ```bash
-docker logs --since 10m $C 2>&1 | grep "page-fault check"
+docker logs --since 10m $C 2>&1 | grep -E "page-fault check|memory check"
 ```
 
-Example line:
+Example lines:
 
 ```
+memory check (process): RSS=238 MiB, locked=238 MiB, peak RSS(VmHWM)=240 MiB -- size the memlock cap from the peak
 page-fault check (control thread): +0 major, +4 minor over 30s (0.00 major/s); lifetime 2 major / 51230 minor
 ```
+
+The `memory check` line is also the data source for sizing a bounded `memlock`
+ulimit: take the **highest `peak RSS(VmHWM)`** seen across a representative run
+(get the max with `docker logs $C 2>&1 | grep -oE 'VmHWM\)=[0-9]+ MiB' | sort -t= -k2 -n | tail -1`),
+then set the cap to that peak plus generous headroom (~1.5–2×, rounded up).
+
+### Controlling the report interval (via `.env`)
+
+The interval is read at startup from `OPTIMUSCLEAN_DRIVERS_MEMORY_LOG_INTERVAL_SEC`
+in the container environment (loaded from the bot's `.env`); default is 30 s, and
+**`<= 0` disables the monitor**. To change or disable it:
+
+```bash
+cd "$OPTIMUSCLEAN_BASE_DIR"
+echo 'OPTIMUSCLEAN_DRIVERS_MEMORY_LOG_INTERVAL_SEC="10"' >> .env   # 10s; use 0 to disable
+# re-run the optimusclean-dev bring-up so the value is passed into the container
+```
+
+Confirm the value reached the container, and the node picked it up:
+
+```bash
+docker exec $C printenv OPTIMUSCLEAN_DRIVERS_MEMORY_LOG_INTERVAL_SEC
+docker logs $C 2>&1 | grep "RT memory monitor:"   # "reporting every 10s" or "disabled"
+```
+
+> If `printenv` shows nothing, the var isn't being passed to the `moveit_drivers`
+> container — add it to the drivers `environment:` passthrough in the compose (or
+> confirm the service's `env_file` points at this `.env`). The node then falls
+> back to the 30 s default.
 
 **Interpret:**
 - **`major/s` ≈ 0 in steady state** → the control thread is not blocking on I/O
@@ -177,7 +209,8 @@ page-fault check (control thread): +0 major, +4 minor over 30s (0.00 major/s); l
 - A burst of **minor** faults only right after startup, then quiet, is expected
   (that is the one-time working-set warm-up).
 
-**Pass:** the `page-fault check` lines appear, and steady-state `major/s` is 0.
+**Pass:** the `memory check` and `page-fault check` lines appear, and steady-state
+`major/s` is 0. Record the highest `peak RSS(VmHWM)` for cap sizing.
 
 ---
 
@@ -215,7 +248,7 @@ than with it defeated, under the same load.
 | 2a — startup log | | `RLIMIT_MEMLOCK: soft=___ hard=___`, mlockall failed? |
 | 2b — VmLck | | `VmLck=___`, `VmRSS=___` |
 | 3 — mlock_demo | | nolock faults=___, lock faults=___ |
-| 4 — self-logging | | steady-state major/s=___ |
+| 4 — self-logging | | steady-state major/s=___, peak RSS(VmHWM)=___ MiB |
 | 5 — A/B (optional) | | locked major/s=___, defeated major/s=___ |
 
 **Tester:** ___________  **Robot / host:** ___________  **Date:** ___________

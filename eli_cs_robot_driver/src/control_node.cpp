@@ -2,6 +2,7 @@
 #include <thread>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 
 #include <unistd.h>
@@ -110,9 +111,21 @@ int main(int argc, char** argv) {
         // mlockall/mallopt/rlimit details).
         rt::configure_realtime_memory(controller_manager->get_logger());
 
-        // Periodically report this thread's page-fault counts to the logs so the
-        // lock's effectiveness is observable in the field without perf/proc tooling.
-        rt::PageFaultMonitor fault_monitor(controller_manager->get_update_rate());
+        // Periodically report page-fault counts and memory footprint to the logs
+        // so the lock's effectiveness (and the peak RSS for sizing the memlock
+        // cap) is observable in the field without perf/proc tooling. The report
+        // interval is set by OPTIMUSCLEAN_DRIVERS_MEMORY_LOG_INTERVAL_SEC in the
+        // container env (.env); <= 0 disables it.
+        const double log_interval =
+            rt::parse_interval_seconds(std::getenv(rt::kLogIntervalEnvVar), rt::kDefaultLogIntervalSeconds);
+        if (log_interval > 0.0) {
+            RCLCPP_INFO(controller_manager->get_logger(),
+                "RT memory monitor: reporting every %.0fs", log_interval);
+        } else {
+            RCLCPP_INFO(controller_manager->get_logger(),
+                "RT memory monitor: disabled (%s <= 0)", rt::kLogIntervalEnvVar);
+        }
+        rt::RtMemoryMonitor memory_monitor(controller_manager->get_update_rate(), log_interval);
 
         // for calculating sleep time
         auto const period = std::chrono::nanoseconds(1'000'000'000 / controller_manager->get_update_rate());
@@ -137,8 +150,8 @@ int main(int argc, char** argv) {
                 controller_manager->update(controller_manager->now(), measured_period);
                 controller_manager->write(controller_manager->now(), measured_period);
 
-                // Emit a page-fault report at most once per log interval.
-                fault_monitor.tick(controller_manager->get_logger());
+                // Emit a fault/memory report at most once per log interval.
+                memory_monitor.tick(controller_manager->get_logger());
 
                 // wait until we hit the end of the period
                 next_iteration_time += period;
