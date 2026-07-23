@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <new>
@@ -94,6 +95,47 @@ inline void reserve_process_memory(std::size_t size) {
 // RSS floor, so it is sized as headroom over the measured footprint; tune with
 // monitoring (SW-933).
 inline constexpr std::size_t kDefaultHeapReserveBytes = 100UL * 1024 * 1024; // 100 MiB
+
+// Format one periodic page-fault report line for the RT control thread. Pure and
+// allocation-cheap so it is unit-tested and safe to build inside the loop. Deltas
+// are since the previous report; totals are thread-lifetime.
+inline std::string format_fault_report(long minor_delta, long major_delta,
+                                       long minor_total, long major_total,
+                                       double interval_seconds) {
+    const double major_per_s =
+        interval_seconds > 0.0 ? static_cast<double>(major_delta) / interval_seconds : 0.0;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "page-fault check (control thread): +%ld major, +%ld minor over %.0fs "
+        "(%.2f major/s); lifetime %ld major / %ld minor",
+        major_delta, minor_delta, interval_seconds, major_per_s, major_total, minor_total);
+    return std::string(buf);
+}
+
+// Default period between page-fault reports. Long enough to keep the logs quiet;
+// the RT concern is any nonzero major-fault rate at all, which shows up regardless.
+inline constexpr double kFaultLogIntervalSeconds = 30.0;
+
+// Periodically logs the calling (control) thread's page-fault counts via
+// getrusage(RUSAGE_THREAD), so fault activity is visible in normal container logs
+// without attaching perf/proc tooling. RT-friendly: call tick() once per loop
+// iteration; it is O(1) and only performs the getrusage syscall + a log line once
+// per log interval (gated by iteration count, so no per-iteration clock call).
+// The first tick establishes the baseline (after startup faulting) and logs
+// nothing. Defined in rt_memory.cpp (needs getrusage + rclcpp).
+class PageFaultMonitor {
+public:
+    PageFaultMonitor(double loop_rate_hz, double log_interval_seconds = kFaultLogIntervalSeconds);
+    void tick(const rclcpp::Logger& logger);
+
+private:
+    long iters_per_log_;
+    double interval_seconds_;
+    long counter_ = 0;
+    bool have_baseline_ = false;
+    long baseline_minflt_ = 0;
+    long baseline_majflt_ = 0;
+};
 
 // Configure the process for real-time memory behavior, logging via `logger`:
 //   1. log the RLIMIT_MEMLOCK the process is working with (an absent/insufficient

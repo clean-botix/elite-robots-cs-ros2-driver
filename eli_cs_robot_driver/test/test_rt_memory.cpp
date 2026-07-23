@@ -72,6 +72,30 @@ TEST(TerminateExitCode, FatalCasesExitNonZero) {
     EXPECT_EQ(rt::terminate_exit_code(rt::TerminateDisposition::FatalException), 1);
 }
 
+// --- format_fault_report -----------------------------------------------------
+
+TEST(FormatFaultReport, ReportsDeltasTotalsAndRate) {
+    const std::string s = rt::format_fault_report(/*minor_delta=*/12, /*major_delta=*/0,
+                                                  /*minor_total=*/40000, /*major_total=*/3,
+                                                  /*interval_seconds=*/10.0);
+    EXPECT_NE(s.find("+0 major"), std::string::npos);
+    EXPECT_NE(s.find("+12 minor"), std::string::npos);
+    EXPECT_NE(s.find("over 10s"), std::string::npos);
+    EXPECT_NE(s.find("0.00 major/s"), std::string::npos);
+    EXPECT_NE(s.find("lifetime 3 major / 40000 minor"), std::string::npos);
+}
+
+TEST(FormatFaultReport, ComputesMajorRate) {
+    const std::string s = rt::format_fault_report(5, 4, 100, 8, 2.0);
+    EXPECT_NE(s.find("+4 major"), std::string::npos);
+    EXPECT_NE(s.find("2.00 major/s"), std::string::npos);
+}
+
+TEST(FormatFaultReport, ZeroIntervalDoesNotDivideByZero) {
+    const std::string s = rt::format_fault_report(1, 1, 1, 1, 0.0);
+    EXPECT_NE(s.find("0.00 major/s"), std::string::npos);
+}
+
 // --- reserve_process_memory --------------------------------------------------
 
 TEST(ReserveProcessMemory, SmallReserveDoesNotCrash) {

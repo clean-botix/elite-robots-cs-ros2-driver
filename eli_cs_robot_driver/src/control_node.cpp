@@ -103,10 +103,16 @@ int main(int argc, char** argv) {
             RCLCPP_WARN(controller_manager->get_logger(), "Could not enable FIFO RT scheduling policy");
         }
 
+        namespace rt = ELITE_CS_ROBOT_ROS_DRIVER::rt_memory;
+
         // Lock the process into RAM and pre-fault a heap reserve so the RT loop
         // doesn't page-fault under memory pressure (see rt_memory.cpp for the
         // mlockall/mallopt/rlimit details).
-        ELITE_CS_ROBOT_ROS_DRIVER::rt_memory::configure_realtime_memory(controller_manager->get_logger());
+        rt::configure_realtime_memory(controller_manager->get_logger());
+
+        // Periodically report this thread's page-fault counts to the logs so the
+        // lock's effectiveness is observable in the field without perf/proc tooling.
+        rt::PageFaultMonitor fault_monitor(controller_manager->get_update_rate());
 
         // for calculating sleep time
         auto const period = std::chrono::nanoseconds(1'000'000'000 / controller_manager->get_update_rate());
@@ -130,6 +136,9 @@ int main(int argc, char** argv) {
                 controller_manager->read(controller_manager->now(), measured_period);
                 controller_manager->update(controller_manager->now(), measured_period);
                 controller_manager->write(controller_manager->now(), measured_period);
+
+                // Emit a page-fault report at most once per log interval.
+                fault_monitor.tick(controller_manager->get_logger());
 
                 // wait until we hit the end of the period
                 next_iteration_time += period;
