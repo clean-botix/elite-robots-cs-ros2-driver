@@ -3,16 +3,21 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 
 #include <unistd.h>
 
 #include <rclcpp/rclcpp.hpp>
 
-// Real-time memory helpers: pure, unit-tested policy (classify_terminate) plus
-// configure_realtime_memory(), which does the mlockall()/mallopt()/logging setup.
-// See rt_memory.hpp / rt_memory.cpp and test/test_rt_memory.cpp.
+// Real-time memory MANAGEMENT: pure, unit-tested policy (classify_terminate)
+// plus configure_realtime_memory(), which does the mlockall()/mallopt()/reserve
+// setup. ROS-free (see rt_memory.hpp); this file does the rclcpp logging around
+// its result. See test/test_rt_memory.cpp.
 #include "eli_cs_robot_driver/rt_memory.hpp"
+// Real-time memory REPORTING: the periodic page-fault/memory-footprint monitor.
+// See test/test_rt_memory_reporting.cpp.
+#include "eli_cs_robot_driver/rt_memory_reporting.hpp"
 
 // Rely on a subclass of ControllerManager to intercept the pre-shutdown hook
 // and execute a workaround for a ROS2 Humble bug to ensure orderly shutdown at termination.
@@ -107,9 +112,21 @@ int main(int argc, char** argv) {
         namespace rt = ELITE_CS_ROBOT_ROS_DRIVER::rt_memory;
 
         // Lock the process into RAM and pre-fault a heap reserve so the RT loop
-        // doesn't page-fault under memory pressure (see rt_memory.cpp for the
-        // mlockall/mallopt/rlimit details).
-        rt::configure_realtime_memory(controller_manager->get_logger());
+        // doesn't page-fault under memory pressure. configure_realtime_memory is
+        // ROS-free (see rt_memory.hpp) and returns raw facts; this is the logging
+        // half of what mlockall/mallopt/rlimit setup needs.
+        const rt::RealtimeMemorySetup setup = rt::configure_realtime_memory();
+        if (setup.getrlimit_succeeded) {
+            RCLCPP_INFO(controller_manager->get_logger(),
+                "RLIMIT_MEMLOCK: soft=%s hard=%s",
+                rt::describe_rlimit(setup.memlock_soft).c_str(),
+                rt::describe_rlimit(setup.memlock_hard).c_str());
+        }
+        if (!setup.mlockall_succeeded) {
+            RCLCPP_WARN(controller_manager->get_logger(),
+                "mlockall failed (%s) — control thread may page-fault under memory pressure",
+                std::strerror(setup.mlockall_errno));
+        }
 
         // Periodically report page-fault counts and memory footprint to the logs
         // so the lock's effectiveness (and the peak RSS for sizing the memlock

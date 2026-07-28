@@ -1,9 +1,11 @@
-// Unit tests for the pure real-time memory helpers in rt_memory.hpp
+// Unit tests for the real-time memory MANAGEMENT helpers in rt_memory.hpp
 // (RLIMIT_MEMLOCK formatting, std::terminate classification, and the heap
-// pre-fault smoke path). The effectful orchestration in rt_memory.cpp
-// (configure_realtime_memory's mlockall()/mallopt()/logging) is not covered here
-// as it requires the deployed container environment; these tests link only the
-// header, not rclcpp.
+// pre-fault smoke path). configure_realtime_memory()'s actual mlockall()/
+// mallopt() effects are not covered here as they require a deployed container
+// (with a sufficient memlock ulimit) to observe success/failure; see
+// doc/rt_memory_test_plan.md and test/manual/mlock_demo.cpp for that.
+// This file (like rt_memory.hpp/.cpp) has no rclcpp dependency -- see
+// test/test_rt_memory_reporting.cpp for the periodic-monitor tests.
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -72,89 +74,6 @@ TEST(TerminateExitCode, FatalCasesExitNonZero) {
     EXPECT_EQ(rt::terminate_exit_code(rt::TerminateDisposition::FatalException), 1);
 }
 
-// --- format_fault_report -----------------------------------------------------
-
-TEST(FormatFaultReport, ReportsDeltasTotalsAndRate) {
-    const std::string s = rt::format_fault_report(/*minor_delta=*/12, /*major_delta=*/0,
-                                                  /*minor_total=*/40000, /*major_total=*/3,
-                                                  /*interval_seconds=*/10.0);
-    EXPECT_NE(s.find("+0 major"), std::string::npos);
-    EXPECT_NE(s.find("+12 minor"), std::string::npos);
-    EXPECT_NE(s.find("over 10s"), std::string::npos);
-    EXPECT_NE(s.find("0.00 major/s"), std::string::npos);
-    EXPECT_NE(s.find("lifetime 3 major / 40000 minor"), std::string::npos);
-}
-
-TEST(FormatFaultReport, ComputesMajorRate) {
-    const std::string s = rt::format_fault_report(5, 4, 100, 8, 2.0);
-    EXPECT_NE(s.find("+4 major"), std::string::npos);
-    EXPECT_NE(s.find("2.00 major/s"), std::string::npos);
-}
-
-TEST(FormatFaultReport, ZeroIntervalDoesNotDivideByZero) {
-    const std::string s = rt::format_fault_report(1, 1, 1, 1, 0.0);
-    EXPECT_NE(s.find("0.00 major/s"), std::string::npos);
-}
-
-// --- parse_interval_seconds --------------------------------------------------
-
-TEST(ParseIntervalSeconds, NullOrEmptyUsesFallback) {
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds(nullptr, 30.0), 30.0);
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("", 30.0), 30.0);
-}
-
-TEST(ParseIntervalSeconds, InvalidUsesFallback) {
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("abc", 30.0), 30.0);
-}
-
-TEST(ParseIntervalSeconds, ParsesValidValues) {
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("15", 30.0), 15.0);
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("12.5", 30.0), 12.5);
-}
-
-TEST(ParseIntervalSeconds, NonPositiveMeansDisabledAndIsReturnedAsIs) {
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("0", 30.0), 0.0);
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("-1", 30.0), -1.0);
-}
-
-// --- parse_status_kb / format_memory_report ----------------------------------
-
-namespace {
-const char* const kSampleStatus =
-    "Name:\tcontrol_node\n"
-    "State:\tR (running)\n"
-    "VmPeak:\t  870400 kB\n"
-    "VmSize:\t  860160 kB\n"
-    "VmHWM:\t  245760 kB\n"
-    "VmRSS:\t  243712 kB\n"
-    "VmLck:\t  243712 kB\n"
-    "Threads:\t12\n";
-}  // namespace
-
-TEST(ParseStatusKb, ReadsNamedFields) {
-    EXPECT_EQ(rt::parse_status_kb(kSampleStatus, "VmHWM"), 245760);
-    EXPECT_EQ(rt::parse_status_kb(kSampleStatus, "VmRSS"), 243712);
-    EXPECT_EQ(rt::parse_status_kb(kSampleStatus, "VmLck"), 243712);
-}
-
-TEST(ParseStatusKb, MissingKeyReturnsMinusOne) {
-    EXPECT_EQ(rt::parse_status_kb(kSampleStatus, "NoSuchKey"), -1);
-    EXPECT_EQ(rt::parse_status_kb("", "VmRSS"), -1);
-}
-
-TEST(FormatMemoryReport, ConvertsKbToMiB) {
-    // 245760 kB = 240 MiB, 243712 kB = 238 MiB
-    const std::string s = rt::format_memory_report(243712, 243712, 245760);
-    EXPECT_NE(s.find("RSS=238 MiB"), std::string::npos);
-    EXPECT_NE(s.find("locked=238 MiB"), std::string::npos);
-    EXPECT_NE(s.find("peak RSS(VmHWM)=240 MiB"), std::string::npos);
-}
-
-TEST(FormatMemoryReport, MissingFieldRendersAsMinusOne) {
-    const std::string s = rt::format_memory_report(-1, -1, -1);
-    EXPECT_NE(s.find("RSS=-1 MiB"), std::string::npos);
-}
-
 // --- reserve_process_memory --------------------------------------------------
 
 TEST(ReserveProcessMemory, SmallReserveDoesNotCrash) {
@@ -167,4 +86,14 @@ TEST(ReserveProcessMemory, SmallReserveDoesNotCrash) {
 TEST(ReserveProcessMemory, ZeroSizeIsSafe) {
     rt::reserve_process_memory(0);
     SUCCEED();
+}
+
+// --- RealtimeMemorySetup (shape only; see note above re: not exercising the
+//     actual mlockall()/mallopt() side effects here) --------------------------
+
+TEST(RealtimeMemorySetup, DefaultConstructedIsAllFalseZero) {
+    const rt::RealtimeMemorySetup setup{};
+    EXPECT_FALSE(setup.getrlimit_succeeded);
+    EXPECT_FALSE(setup.mlockall_succeeded);
+    EXPECT_EQ(setup.mlockall_errno, 0);
 }
