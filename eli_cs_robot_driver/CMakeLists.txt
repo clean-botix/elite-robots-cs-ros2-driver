@@ -232,6 +232,10 @@ if(BUILD_TESTING)
   # Unit tests for the real-time memory REPORTING helpers (rt_memory_reporting.hpp).
   ament_add_gtest(test_rt_memory_reporting test/test_rt_memory_reporting.cpp)
   target_include_directories(test_rt_memory_reporting PRIVATE include)
+
+  # Regression test for elite_control.launch.py's bool-typed launch parameters.
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_elite_control_launch test/test_elite_control_launch.py)
 endif()
 
 ament_package()

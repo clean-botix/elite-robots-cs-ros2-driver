@@ -1,5 +1,5 @@
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterFile
+from launch_ros.parameter_descriptions import ParameterFile, ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 from launch import LaunchDescription
@@ -253,8 +253,8 @@ def launch_setup(context, *args, **kwargs):
         emulate_tty=True,
         condition=UnlessCondition(use_fake_hardware),
         parameters=[
-            {"headless_mode": headless_mode},
-            {"joint_controller_active": activate_joint_controller},
+            {"headless_mode": ParameterValue(headless_mode, value_type=bool)},
+            {"joint_controller_active": ParameterValue(activate_joint_controller, value_type=bool)},
             {
                 "consistent_controllers": [
                     "io_and_status_controller",
