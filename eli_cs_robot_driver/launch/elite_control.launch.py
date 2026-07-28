@@ -204,7 +204,7 @@ def launch_setup(context, *args, **kwargs):
     # cs_update_rate.yaml above: point runtime_config_package at a package with
     # its own config/rt_memory.yaml to shadow these defaults, or pass
     # --ros-args -p rt_memory.log_interval_sec:=... at launch. See
-    # config/rt_memory.yaml and doc/rt_memory_test_plan.md.
+    # See config/rt_memory.yaml.
     rt_memory_config_file = PathJoinSubstitution(
         [
             FindPackageShare(runtime_config_package),

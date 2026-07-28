@@ -22,7 +22,7 @@
 //
 // Build & run (from the eli_cs_robot_driver package root):
 //   g++ -O2 -std=c++17 -Iinclude test/manual/mlock_demo.cpp src/rt_memory.cpp -o /tmp/mlock_demo
-//   ulimit -l unlimited   # mirror the deployed drivers ulimit; see doc/rt_memory_test_plan.md
+//   ulimit -l unlimited   # mirror the deployed drivers memlock ulimit
 //   /tmp/mlock_demo --nolock
 //   /tmp/mlock_demo --lock
 #include <cerrno>

@@ -3,7 +3,7 @@
 // pre-fault smoke path). configure_realtime_memory()'s actual mlockall()/
 // mallopt() effects are not covered here as they require a deployed container
 // (with a sufficient memlock ulimit) to observe success/failure; see
-// doc/rt_memory_test_plan.md and test/manual/mlock_demo.cpp for that.
+// test/manual/mlock_demo.cpp for that.
 // This file (like rt_memory.hpp/.cpp) has no rclcpp dependency -- see
 // test/test_rt_memory_reporting.cpp for the periodic-monitor tests.
 #include <exception>

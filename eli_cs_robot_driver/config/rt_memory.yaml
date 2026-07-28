@@ -5,7 +5,7 @@ controller_manager:
     # rather than inside the real-time loop. With glibc M_TRIM_THRESHOLD=-1 (set
     # alongside the lock) this becomes a permanent RSS floor -- size it from the
     # peak RSS (VmHWM) reported by the periodic memory-footprint log plus
-    # headroom, not by guessing. See doc/rt_memory_test_plan.md.
+    # headroom, not by guessing.
     rt_memory.heap_reserve_mb: 100.0
 
     # Seconds between periodic page-fault / memory-footprint report log lines
