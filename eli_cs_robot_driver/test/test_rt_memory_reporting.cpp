@@ -1,9 +1,8 @@
 // Unit tests for the real-time memory REPORTING helpers in
 // rt_memory_reporting.hpp (page-fault report formatting, /proc/status field
-// parsing, memory-footprint report formatting, env-var interval parsing).
-// RtMemoryMonitor::tick()'s actual getrusage()/file-read/logging behavior is not
-// covered here (it needs rclcpp); these tests link only the header's pure
-// functions.
+// parsing, memory-footprint report formatting). RtMemoryMonitor::tick()'s actual
+// getrusage()/file-read/logging behavior is not covered here (it needs rclcpp);
+// these tests link only the header's pure functions.
 #include <string>
 
 #include <gtest/gtest.h>
@@ -74,23 +73,8 @@ TEST(FormatMemoryReport, MissingFieldRendersAsMinusOne) {
     EXPECT_NE(s.find("RSS=-1 MiB"), std::string::npos);
 }
 
-// --- parse_interval_seconds --------------------------------------------------
+// --- kDefaultLogIntervalSeconds -----------------------------------------------
 
-TEST(ParseIntervalSeconds, NullOrEmptyUsesFallback) {
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds(nullptr, 30.0), 30.0);
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("", 30.0), 30.0);
-}
-
-TEST(ParseIntervalSeconds, InvalidUsesFallback) {
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("abc", 30.0), 30.0);
-}
-
-TEST(ParseIntervalSeconds, ParsesValidValues) {
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("15", 30.0), 15.0);
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("12.5", 30.0), 12.5);
-}
-
-TEST(ParseIntervalSeconds, NonPositiveMeansDisabledAndIsReturnedAsIs) {
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("0", 30.0), 0.0);
-    EXPECT_DOUBLE_EQ(rt::parse_interval_seconds("-1", 30.0), -1.0);
+TEST(DefaultLogIntervalSeconds, MatchesDocumentedDefault) {
+    EXPECT_DOUBLE_EQ(rt::kDefaultLogIntervalSeconds, 30.0);
 }

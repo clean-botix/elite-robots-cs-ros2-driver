@@ -1,0 +1,13 @@
+controller_manager:
+  ros__parameters:
+    # Heap headroom (MiB) pre-faulted before the control loop starts, so
+    # first-touch page faults for the process's working set happen at startup
+    # rather than inside the real-time loop. With glibc M_TRIM_THRESHOLD=-1 (set
+    # alongside the lock) this becomes a permanent RSS floor -- size it from the
+    # peak RSS (VmHWM) reported by the periodic memory-footprint log plus
+    # headroom, not by guessing. See doc/rt_memory_test_plan.md.
+    rt_memory.heap_reserve_mb: 100.0
+
+    # Seconds between periodic page-fault / memory-footprint report log lines
+    # from the control loop. <= 0 disables the monitor entirely.
+    rt_memory.log_interval_sec: 30.0

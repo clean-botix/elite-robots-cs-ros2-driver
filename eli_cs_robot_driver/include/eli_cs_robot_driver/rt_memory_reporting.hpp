@@ -12,7 +12,6 @@
 #pragma once
 
 #include <cstdio>
-#include <cstdlib>
 #include <string>
 
 namespace rclcpp {
@@ -75,30 +74,11 @@ inline std::string format_memory_report(long vmrss_kb, long vmlck_kb, long vmhwm
     return std::string(buf);
 }
 
-// Default period between monitor reports. Long enough to keep the logs quiet;
-// the RT concern is any nonzero major-fault rate at all, which shows up
-// regardless of interval length.
+// Default period between monitor reports, used when the rt_memory.log_interval_sec
+// ROS2 parameter (see config/rt_memory.yaml) is not set. Long enough to keep the
+// logs quiet; the RT concern is any nonzero major-fault rate at all, which shows
+// up regardless of interval length.
 inline constexpr double kDefaultLogIntervalSeconds = 30.0;
-
-// Env var (read in control_node.cpp) that overrides the report interval in
-// seconds. A value <= 0 disables the monitor; absent/empty/invalid uses the
-// default above. Set it in the bot's .env (loaded into the container).
-inline constexpr const char* kLogIntervalEnvVar = "OPTIMUSCLEAN_DRIVERS_MEMORY_LOG_INTERVAL_SEC";
-
-// Parse a seconds value from an env-var string. Null/empty/non-numeric returns
-// `fallback`; a valid value (including <= 0, meaning "disabled") is returned as
-// parsed. Pure/testable.
-inline double parse_interval_seconds(const char* value, double fallback) {
-    if (value == nullptr || *value == '\0') {
-        return fallback;
-    }
-    char* end = nullptr;
-    const double parsed = std::strtod(value, &end);
-    if (end == value) {  // no digits consumed
-        return fallback;
-    }
-    return parsed;
-}
 
 // Periodically logs the calling (control) thread's page-fault counts (via
 // getrusage(RUSAGE_THREAD)) and the process memory footprint (VmRSS/VmLck/VmHWM

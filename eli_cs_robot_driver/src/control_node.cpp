@@ -2,7 +2,6 @@
 #include <thread>
 #include <csignal>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <exception>
 
@@ -103,8 +102,28 @@ int main(int argc, char** argv) {
     // controller_manager->now() requires the node to be associated with an executor.
     executor->add_node(controller_manager);
 
+    namespace rt = ELITE_CS_ROBOT_ROS_DRIVER::rt_memory;
+
+    // RT memory tuning is exposed as ROS2 parameters (siblings of the node's
+    // other configuration, e.g. update_rate) rather than environment variables,
+    // so they can be set the same way as everything else the node reads --
+    // config/rt_memory.yaml, a launch override, or --ros-args -p -- without a
+    // recompile. Declared/read once here (main thread) and passed into the
+    // control loop by value.
+    controller_manager->declare_parameter<double>(
+        "rt_memory.heap_reserve_mb",
+        static_cast<double>(rt::kDefaultHeapReserveBytes) / (1024.0 * 1024.0));
+    controller_manager->declare_parameter<double>(
+        "rt_memory.log_interval_sec", rt::kDefaultLogIntervalSeconds);
+    const double heap_reserve_mb =
+        controller_manager->get_parameter("rt_memory.heap_reserve_mb").as_double();
+    const double log_interval_sec =
+        controller_manager->get_parameter("rt_memory.log_interval_sec").as_double();
+    const std::size_t heap_reserve_bytes =
+        static_cast<std::size_t>(heap_reserve_mb * 1024.0 * 1024.0);
+
     // Control loop thread
-    std::thread control_loop([controller_manager]() {
+    std::thread control_loop([controller_manager, heap_reserve_bytes, log_interval_sec]() {
         if (!realtime_tools::configure_sched_fifo(50)) {
             RCLCPP_WARN(controller_manager->get_logger(), "Could not enable FIFO RT scheduling policy");
         }
@@ -115,7 +134,7 @@ int main(int argc, char** argv) {
         // doesn't page-fault under memory pressure. configure_realtime_memory is
         // ROS-free (see rt_memory.hpp) and returns raw facts; this is the logging
         // half of what mlockall/mallopt/rlimit setup needs.
-        const rt::RealtimeMemorySetup setup = rt::configure_realtime_memory();
+        const rt::RealtimeMemorySetup setup = rt::configure_realtime_memory(heap_reserve_bytes);
         if (setup.getrlimit_succeeded) {
             RCLCPP_INFO(controller_manager->get_logger(),
                 "RLIMIT_MEMLOCK: soft=%s hard=%s",
@@ -131,18 +150,15 @@ int main(int argc, char** argv) {
         // Periodically report page-fault counts and memory footprint to the logs
         // so the lock's effectiveness (and the peak RSS for sizing the memlock
         // cap) is observable in the field without perf/proc tooling. The report
-        // interval is set by OPTIMUSCLEAN_DRIVERS_MEMORY_LOG_INTERVAL_SEC in the
-        // container env (.env); <= 0 disables it.
-        const double log_interval =
-            rt::parse_interval_seconds(std::getenv(rt::kLogIntervalEnvVar), rt::kDefaultLogIntervalSeconds);
-        if (log_interval > 0.0) {
+        // interval is the rt_memory.log_interval_sec ROS2 parameter; <= 0 disables it.
+        if (log_interval_sec > 0.0) {
             RCLCPP_INFO(controller_manager->get_logger(),
-                "RT memory monitor: reporting every %.0fs", log_interval);
+                "RT memory monitor: reporting every %.0fs", log_interval_sec);
         } else {
             RCLCPP_INFO(controller_manager->get_logger(),
-                "RT memory monitor: disabled (%s <= 0)", rt::kLogIntervalEnvVar);
+                "RT memory monitor: disabled (rt_memory.log_interval_sec <= 0)");
         }
-        rt::RtMemoryMonitor memory_monitor(controller_manager->get_update_rate(), log_interval);
+        rt::RtMemoryMonitor memory_monitor(controller_manager->get_update_rate(), log_interval_sec);
 
         // for calculating sleep time
         auto const period = std::chrono::nanoseconds(1'000'000'000 / controller_manager->get_update_rate());

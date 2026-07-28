@@ -90,8 +90,10 @@ inline void reserve_process_memory(std::size_t size) {
 }
 
 // Default heap headroom for reserve_process_memory() to pre-fault before the RT
-// loop. With glibc M_TRIM_THRESHOLD=-1 in effect this becomes a permanent RSS
-// floor, so it should be sized as headroom over the measured footprint (SW-933).
+// loop, used when no ROS2 parameter overrides it (see rt_memory.heap_reserve_mb
+// in config/rt_memory.yaml). With glibc M_TRIM_THRESHOLD=-1 in effect this
+// becomes a permanent RSS floor, so it should be sized as headroom over the
+// measured footprint; tune via the parameter rather than recompiling (SW-933).
 inline constexpr std::size_t kDefaultHeapReserveBytes = 100UL * 1024 * 1024; // 100 MiB
 
 // Raw facts from one configure_realtime_memory() call. No interpretation and no

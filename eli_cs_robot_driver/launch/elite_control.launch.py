@@ -199,6 +199,20 @@ def launch_setup(context, *args, **kwargs):
         ]
     )
 
+    # RT memory tuning (heap reserve size, page-fault/memory report interval) for
+    # eli_ros2_control_node's rt_memory.* parameters. Overridable the same way as
+    # cs_update_rate.yaml above: point runtime_config_package at a package with
+    # its own config/rt_memory.yaml to shadow these defaults, or pass
+    # --ros-args -p rt_memory.log_interval_sec:=... at launch. See
+    # config/rt_memory.yaml and doc/rt_memory_test_plan.md.
+    rt_memory_config_file = PathJoinSubstitution(
+        [
+            FindPackageShare(runtime_config_package),
+            "config",
+            "rt_memory.yaml",
+        ]
+    )
+
     control_node = Node(
         package="controller_manager",
         executable="ros2_control_node",
@@ -217,6 +231,7 @@ def launch_setup(context, *args, **kwargs):
         parameters=[
             robot_description,
             update_rate_config_file,
+            rt_memory_config_file,
             ParameterFile(initial_joint_controllers, allow_substs=True),
         ],
         output="screen",
