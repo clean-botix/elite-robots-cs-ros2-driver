@@ -16,6 +16,17 @@ def test_controller_stopper_bool_params_are_wrapped():
     assert '{"joint_controller_active": activate_joint_controller}' not in source
 
 
+def test_freedrive_controller_is_consistent():
+    # controller_stopper_node deactivates every active controller not in
+    # consistent_controllers whenever io_and_status_controller/robot_task_running
+    # goes false -- which it does while manually jogging in Freedrive, since no
+    # program is "running". Without freedrive_controller on this list, Freedrive
+    # is deactivated immediately after being enabled (observed live). Guard
+    # against dropping it from the list again.
+    source = LAUNCH_FILE.read_text()
+    assert '"freedrive_controller",' in source
+
+
 def test_parameter_value_resolves_launch_configuration_to_bool():
     # Confirms the actual fix mechanism: ParameterValue(..., value_type=bool)
     # turns a LaunchConfiguration's string ("true"/"false") into a real Python

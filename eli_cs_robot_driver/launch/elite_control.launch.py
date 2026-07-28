@@ -261,6 +261,7 @@ def launch_setup(context, *args, **kwargs):
                     "force_torque_sensor_broadcaster",
                     "joint_state_broadcaster",
                     "speed_scaling_state_broadcaster",
+                    "freedrive_controller",
                 ]
             },
         ],
