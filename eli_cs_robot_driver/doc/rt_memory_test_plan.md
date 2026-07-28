@@ -1,6 +1,23 @@
 # RT Memory Locking — Test Plan
 
-**Branch:** `ross/sw-933-investigate-mlockall` &nbsp;•&nbsp; **Ticket:** SW-933 &nbsp;•&nbsp; **PR:** #12
+## Status of this document
+
+This is a **permanent reference doc** living in this repository (`doc/`), not
+PR-scoped throwaway text. It originated alongside [SW-933](https://linear.app/clean-botix/issue/SW-933)
+/ PR [#12](https://github.com/Clean-Botix/elite-robots-cs-ros2-driver/pull/12),
+which introduced the RT memory locking described below, but its purpose outlives
+that PR: use it whenever
+
+- validating a build of this driver that touches `rt_memory.*` before it ships,
+- re-tuning the `rt_memory.heap_reserve_mb` parameter or the deployed `memlock`
+  ulimit cap (see Test 4), or
+- investigating a suspected regression in RT memory behavior (page faults,
+  EtherCAT SM watchdog trips) on a fleet robot.
+
+Steps below that need a specific git ref (e.g. "Getting a branch onto a bot")
+are written generically — substitute whatever ref you are validating. Where the
+original PR's branch name is shown, it is a **worked example only**, not a
+standing instruction; that branch will not exist once merged.
 
 ## What this change does
 
@@ -15,25 +32,32 @@ otherwise starve the cyclic EtherCAT update and trip slave SM watchdogs
 4. periodically logs the control thread's page-fault counts and the process
    memory footprint (RSS / locked / peak RSS).
 
+The locking/allocator-tuning logic (1–3) lives in `include/eli_cs_robot_driver/rt_memory.hpp`
+and `src/rt_memory.cpp`, and is deliberately ROS-free so it can be unit-tested
+and linked by `test/manual/mlock_demo.cpp` (Test 3) without a ROS install. The
+periodic reporting (4) lives in `rt_memory_reporting.hpp`/`.cpp`, which does need
+rclcpp for logging.
+
 **Critical dependency:** `mlockall()` only succeeds if the container grants a
 sufficient `memlock` ulimit. The generated compose already grants
 `ulimits.memlock: -1` (unlimited) to the drivers service **when
 `REAL_TIME_KERNEL == 'true'`**, so for this test you force that flag via the
-bot's `.env` (see "Getting this branch onto a bot"). Without the ulimit the lock
+bot's `.env` (see "Getting a build onto a bot"). Without the ulimit the lock
 silently fails and the whole change is a no-op. Tests 1–2 below detect that
 condition directly.
 
-## Getting this (pre-merge) branch onto a bot
+## Getting a build onto a bot
 
 This driver is **not built directly**. It is a forked dependency vendored into the
 MoveIt Pro workspace (`optimusclean/moveit`) via
 [vendir](https://github.com/carvel-dev/vendir), compiled into the
-`moveit-drivers` image, which the robot then runs. Because this branch is not yet
-merged, you build a `moveit-drivers` image from it yourself and load it on the bot.
+`moveit-drivers` image, which the robot then runs. To test a ref that is not yet
+merged (or not yet the fleet's deployed image), build a `moveit-drivers` image
+from it yourself and load it on the bot.
 
 Two independent pieces must both be present on the bot for a valid test:
 
-1. **The driver code** (this branch) — baked into the `moveit-drivers` image via
+1. **The driver code under test** — baked into the `moveit-drivers` image via
    vendir, per the steps below.
 2. **The `memlock: -1` ulimit** — set `REAL_TIME_KERNEL="true"` in the bot's
    `.env` (see next section). The generated compose already grants
@@ -64,14 +88,15 @@ SHA is recorded in `vendir.lock.yml`.
 
 In an `optimusclean/moveit` workspace:
 
-1. Point the pin at this branch (temporary — **do not commit** the vendir change):
+1. Point the pin at the ref under test (temporary — **do not commit** the vendir
+   change unless you are intentionally bumping the pin):
    ```bash
    cd optimusclean/moveit
    # in vendir.yml, under Elite_Robots_CS_ROS2_Driver, set:
-   #     ref: ross/sw-933-investigate-mlockall
-   just deps-sync                 # vendir sync + perms fix; pulls the branch in
+   #     ref: <ref-under-test>          # e.g. ross/sw-933-investigate-mlockall (example only)
+   just deps-sync                 # vendir sync + perms fix; pulls the ref in
    ```
-2. Confirm the branch's code actually landed in the workspace:
+2. Confirm the code actually landed in the workspace:
    ```bash
    ls src/external_dependencies/Elite_Robots_CS_ROS2_Driver/eli_cs_robot_driver/src/rt_memory.cpp
    grep -R "configure_realtime_memory" \
@@ -133,8 +158,15 @@ Validates the kernel behavior the fix relies on: locked memory is not reclaimed.
 No robot cycle, root, or swap required. Runs in the dev/drivers container or any
 Linux box. Source: `test/manual/mlock_demo.cpp`.
 
+`mlock_demo` calls `configure_realtime_memory()` from `rt_memory.hpp`/`.cpp` --
+the exact same production locking function the control node uses, not a
+reimplementation -- so it links that file directly (still no ROS/colcon
+required, since `rt_memory.cpp` is ROS-free).
+
+Run from the `eli_cs_robot_driver` package root:
+
 ```bash
-g++ -O2 -std=c++17 test/manual/mlock_demo.cpp -o /tmp/mlock_demo
+g++ -O2 -std=c++17 -Iinclude test/manual/mlock_demo.cpp src/rt_memory.cpp -o /tmp/mlock_demo
 ulimit -l unlimited        # mirror the deployed drivers ulimit
 /tmp/mlock_demo --nolock
 /tmp/mlock_demo --lock
@@ -176,29 +208,38 @@ ulimit: take the **highest `peak RSS(VmHWM)`** seen across a representative run
 (get the max with `docker logs $C 2>&1 | grep -oE 'VmHWM\)=[0-9]+ MiB' | sort -t= -k2 -n | tail -1`),
 then set the cap to that peak plus generous headroom (~1.5–2×, rounded up).
 
-### Controlling the report interval (via `.env`)
+### Controlling RT memory parameters
 
-The interval is read at startup from `OPTIMUSCLEAN_DRIVERS_MEMORY_LOG_INTERVAL_SEC`
-in the container environment (loaded from the bot's `.env`); default is 30 s, and
-**`<= 0` disables the monitor**. To change or disable it:
+`rt_memory.log_interval_sec` (report interval; `<= 0` disables the monitor) and
+`rt_memory.heap_reserve_mb` (heap pre-fault size) are **ROS2 parameters** on the
+`controller_manager` node — siblings of the node's other configuration (e.g.
+`update_rate`), not environment variables. Defaults live in
+`config/rt_memory.yaml` and are wired into `eli_ros2_control_node` by
+`launch/elite_control.launch.py`.
+
+To override without recompiling, either:
+
+- **Shadow the config file**, the same way `cs_update_rate.yaml` is overridden:
+  point the launch's `runtime_config_package` argument at a package with its own
+  `config/rt_memory.yaml`, or
+- **Pass it directly at launch**, e.g.:
+  ```bash
+  ros2 launch eli_cs_robot_driver elite_control.launch.py \
+    ... --ros-args -p rt_memory.log_interval_sec:=10.0
+  ```
+
+Confirm the node picked it up:
 
 ```bash
-cd "$OPTIMUSCLEAN_BASE_DIR"
-echo 'OPTIMUSCLEAN_DRIVERS_MEMORY_LOG_INTERVAL_SEC="10"' >> .env   # 10s; use 0 to disable
-# re-run the optimusclean-dev bring-up so the value is passed into the container
-```
-
-Confirm the value reached the container, and the node picked it up:
-
-```bash
-docker exec $C printenv OPTIMUSCLEAN_DRIVERS_MEMORY_LOG_INTERVAL_SEC
 docker logs $C 2>&1 | grep "RT memory monitor:"   # "reporting every 10s" or "disabled"
 ```
 
-> If `printenv` shows nothing, the var isn't being passed to the `moveit_drivers`
-> container — add it to the drivers `environment:` passthrough in the compose (or
-> confirm the service's `env_file` points at this `.env`). The node then falls
-> back to the 30 s default.
+To inspect the live value on a running node:
+
+```bash
+docker exec $C ros2 param get /controller_manager rt_memory.log_interval_sec
+docker exec $C ros2 param get /controller_manager rt_memory.heap_reserve_mb
+```
 
 **Interpret:**
 - **`major/s` ≈ 0 in steady state** → the control thread is not blocking on I/O
@@ -252,6 +293,7 @@ than with it defeated, under the same load.
 | 5 — A/B (optional) | | locked major/s=___, defeated major/s=___ |
 
 **Tester:** ___________  **Robot / host:** ___________  **Date:** ___________
+**Ref under test:** ___________
 **Kernel:** `uname -a` → ___________ (PREEMPT_RT?  yes / no)
 
 ## Notes for the tester
