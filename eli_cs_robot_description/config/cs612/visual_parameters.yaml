@@ -10,7 +10,7 @@ mesh_files:
     collision:
       mesh:
         package: eli_cs_robot_description
-        path: meshes/cs612/collision/base.stl
+        path: meshes/cs612/collision/base_simple.stl
 
   shoulder:
     visual:
@@ -23,7 +23,7 @@ mesh_files:
     collision:
       mesh:
         package: eli_cs_robot_description
-        path: meshes/cs612/collision/shoulder.stl
+        path: meshes/cs612/collision/shoulder_simple.stl
 
   upperarm:
     visual:
@@ -36,7 +36,7 @@ mesh_files:
     collision:
       mesh:
         package: eli_cs_robot_description
-        path: meshes/cs612/collision/upperarm.stl
+        path: meshes/cs612/collision/forearm_simple.stl
       mesh_files:
 
   forearm:
@@ -50,7 +50,7 @@ mesh_files:
     collision:
       mesh:
         package: eli_cs_robot_description
-        path: meshes/cs612/collision/forearm.stl
+        path: meshes/cs612/collision/upperarm_simple.stl
 
   wrist_1:
     visual:
@@ -63,7 +63,7 @@ mesh_files:
     collision:
       mesh:
         package: eli_cs_robot_description
-        path: meshes/cs612/collision/wrist1.stl
+        path: meshes/cs612/collision/wrist1_simple.stl
 
   wrist_2:
     visual:
@@ -76,7 +76,7 @@ mesh_files:
     collision:
       mesh:
         package: eli_cs_robot_description
-        path: meshes/cs612/collision/wrist2.stl
+        path: meshes/cs612/collision/wrist2_simple.stl
 
   wrist_3:
     visual:
@@ -89,4 +89,4 @@ mesh_files:
     collision:
       mesh:
         package: eli_cs_robot_description
-        path: meshes/cs612/collision/wrist3.stl
+        path: meshes/cs612/collision/wrist3_simple.stl
