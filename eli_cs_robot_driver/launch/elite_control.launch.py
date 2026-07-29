@@ -1,5 +1,5 @@
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterFile
+from launch_ros.parameter_descriptions import ParameterFile, ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 from launch import LaunchDescription
@@ -199,6 +199,20 @@ def launch_setup(context, *args, **kwargs):
         ]
     )
 
+    # RT memory tuning (heap reserve size, page-fault/memory report interval) for
+    # eli_ros2_control_node's rt_memory.* parameters. Overridable the same way as
+    # cs_update_rate.yaml above: point runtime_config_package at a package with
+    # its own config/rt_memory.yaml to shadow these defaults, or pass
+    # --ros-args -p rt_memory.log_interval_sec:=... at launch. See
+    # See config/rt_memory.yaml.
+    rt_memory_config_file = PathJoinSubstitution(
+        [
+            FindPackageShare(runtime_config_package),
+            "config",
+            "rt_memory.yaml",
+        ]
+    )
+
     control_node = Node(
         package="controller_manager",
         executable="ros2_control_node",
@@ -217,6 +231,7 @@ def launch_setup(context, *args, **kwargs):
         parameters=[
             robot_description,
             update_rate_config_file,
+            rt_memory_config_file,
             ParameterFile(initial_joint_controllers, allow_substs=True),
         ],
         output="screen",
@@ -238,14 +253,15 @@ def launch_setup(context, *args, **kwargs):
         emulate_tty=True,
         condition=UnlessCondition(use_fake_hardware),
         parameters=[
-            {"headless_mode": headless_mode},
-            {"joint_controller_active": activate_joint_controller},
+            {"headless_mode": ParameterValue(headless_mode, value_type=bool)},
+            {"joint_controller_active": ParameterValue(activate_joint_controller, value_type=bool)},
             {
                 "consistent_controllers": [
                     "io_and_status_controller",
                     "force_torque_sensor_broadcaster",
                     "joint_state_broadcaster",
                     "speed_scaling_state_broadcaster",
+                    "freedrive_controller",
                 ]
             },
         ],
