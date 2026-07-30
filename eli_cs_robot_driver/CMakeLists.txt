@@ -233,6 +233,17 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rt_memory_reporting test/test_rt_memory_reporting.cpp)
   target_include_directories(test_rt_memory_reporting PRIVATE include)
 
+  # Regression tests for ControllerStopper's restart path (configure-before-activate and
+  # BEST_EFFORT strictness). Drives the real class against a fake controller manager, so it
+  # links controller_stopper.cpp and needs rclcpp.
+  ament_add_gtest(test_controller_stopper test/test_controller_stopper.cpp src/controller_stopper.cpp)
+  target_include_directories(test_controller_stopper PRIVATE include)
+  ament_target_dependencies(
+    test_controller_stopper
+    ${${PROJECT_NAME}_EXPORTED_TARGETS}
+    ${THIS_PACKAGE_DEPENDENCIES}
+  )
+
   # Regression test for elite_control.launch.py's bool-typed launch parameters.
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_elite_control_launch test/test_elite_control_launch.py)
