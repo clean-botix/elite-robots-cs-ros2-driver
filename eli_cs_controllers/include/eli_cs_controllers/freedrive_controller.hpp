@@ -1,7 +1,7 @@
 #ifndef __ELITE_CS_CONTROLLERS_FREEDRIVE_CONTROLLER_HPP__
 #define __ELITE_CS_CONTROLLERS_FREEDRIVE_CONTROLLER_HPP__
 
-#include <freedrive_controller_parameters.hpp>
+#include <eli_cs_controllers/freedrive_controller_parameters.hpp>
 
 #include <atomic>
 #include <controller_interface/controller_interface.hpp>
