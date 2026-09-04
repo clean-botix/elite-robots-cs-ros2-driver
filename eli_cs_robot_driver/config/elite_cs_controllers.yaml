@@ -12,8 +12,8 @@ controller_manager:
     joint_trajectory_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
-    servo_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
+    joint_velocity_controller:
+      type: joint_velocity_controller/JointVelocityController
 
     forward_velocity_controller:
       type: velocity_controllers/JointGroupVelocityController
@@ -38,16 +38,8 @@ controller_manager:
 
 velocity_force_controller:
   ros__parameters:
-    # Joints that the controller will control.
-    joints:
-      - $(var tf_prefix)shoulder_pan_joint
-      - $(var tf_prefix)shoulder_lift_joint
-      - $(var tf_prefix)elbow_joint
-      - $(var tf_prefix)wrist_1_joint
-      - $(var tf_prefix)wrist_2_joint
-      - $(var tf_prefix)wrist_3_joint
-    # Base frame of the kinematic chain, for computation of arm kinematics.
-    base_frame: base_link
+    # Since MoveIt Pro 9.0, joints and base_frame are derived from planning_group_name.
+    planning_group_name: cs612_manipulator
     # The tip link of the kinematic chain, i.e. the frame that will be controlled.
     ee_frame: tool0
     # The frame where the force / torque sensor reading is given.
@@ -105,8 +97,6 @@ velocity_force_controller:
 joint_trajectory_admittance_controller:
   ros__parameters:
     planning_group_name: cs612_manipulator
-    # Specifies the base link of the kinematic chain. Must exist in the robot description.
-    base_frame: base_link
     # Specifies the frame/link name of the force torque sensor. Must exist in the robot description.
     sensor_frame: tool0
     # Specifies the frame/link name of the end-effector frame. Must exist in the robot description.
@@ -194,32 +184,28 @@ joint_trajectory_controller:
       $(var tf_prefix)wrist_2_joint: { trajectory: 1.25, goal: 0.1 }
       $(var tf_prefix)wrist_3_joint: { trajectory: 1.25, goal: 0.1 }
 
-servo_controller:
+joint_velocity_controller:
   ros__parameters:
-    joints:
-      - $(var tf_prefix)shoulder_pan_joint
-      - $(var tf_prefix)shoulder_lift_joint
-      - $(var tf_prefix)elbow_joint
-      - $(var tf_prefix)wrist_1_joint
-      - $(var tf_prefix)wrist_2_joint
-      - $(var tf_prefix)wrist_3_joint
-    command_interfaces:
-      - position
-    state_interfaces:
-      - position
-      - velocity
-    state_publish_rate: 100.0
-    action_monitor_rate: 20.0
-    allow_partial_joints_goal: false
-    constraints:
-      stopped_velocity_tolerance: 0.2
-      goal_time: 0.05
-      $(var tf_prefix)shoulder_pan_joint: { trajectory: 1.25, goal: 0.1 }
-      $(var tf_prefix)shoulder_lift_joint: { trajectory: 1.25, goal: 0.1 }
-      $(var tf_prefix)elbow_joint: { trajectory: 1.25, goal: 0.1 }
-      $(var tf_prefix)wrist_1_joint: { trajectory: 1.25, goal: 0.1 }
-      $(var tf_prefix)wrist_2_joint: { trajectory: 1.25, goal: 0.1 }
-      $(var tf_prefix)wrist_3_joint: { trajectory: 1.25, goal: 0.1 }
+    planning_group_name: cs612_manipulator
+    # Velocity/acceleration limits match this robot's velocity_force_controller values.
+    max_joint_velocity:
+      - 0.524
+      - 0.524
+      - 0.524
+      - 1.047
+      - 1.047
+      - 1.047
+    max_joint_acceleration:
+      - 0.524
+      - 0.524
+      - 0.524
+      - 0.524
+      - 0.524
+      - 0.524
+    command_interfaces: ["position"]
+    joint_limit_position_tolerance: 0.02
+    command_timeout: 0.2
+    state_publish_rate: 20
 
 forward_velocity_controller:
   ros__parameters:
