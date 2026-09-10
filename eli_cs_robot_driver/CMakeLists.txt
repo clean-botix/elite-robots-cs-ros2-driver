@@ -167,6 +167,7 @@ add_executable(
   src/rt_memory.cpp
   src/rt_memory_reporting.cpp
   src/rt_sched.cpp
+  src/rt_timebase.cpp
 )
 ament_target_dependencies(
   eli_ros2_control_node

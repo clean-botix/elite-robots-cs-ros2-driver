@@ -25,3 +25,18 @@ controller_manager:
     # CPU to pin the loop thread to; -1 = leave affinity alone. A CPU outside the
     # container's cpuset is reported as a failed pin and the loop stays unpinned.
     # rt_sched.cpu: -1
+
+    # Control loop TIMEBASE report (rt_timebase.hpp). The loop schedules on
+    # CLOCK_MONOTONIC with absolute deadlines and records each cycle's measured
+    # period, lateness and any overrun (a wake-up a full period or more late,
+    # after which the grid restarts from "now" instead of bursting to catch up)
+    # into lock-free counters. A wall timer on the executor thread logs one
+    # "Control loop timing:" line per interval with n and the monotonic span of
+    # those cycles ("n=1500 over 30.00 s"), min/mean/max/std of the period,
+    # overruns, clamps (dt handed to the controllers capped at 10 periods) and
+    # the largest lateness since the previous line. <= 0 disables the log line
+    # only; the loop still counts. Caveat: the interval is a wall timer on the
+    # executor and its cadence shifts with wall-clock steps (rmw waits on
+    # CLOCK_REALTIME), e.g. a -1 s NTP step makes one window 7 s long. Everything
+    # inside the line is monotonic and exact; read "over N s", not the cadence.
+    rt_timebase.report_interval_sec: 30.0

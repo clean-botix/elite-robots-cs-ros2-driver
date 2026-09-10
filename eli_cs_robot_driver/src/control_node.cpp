@@ -1,3 +1,4 @@
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <csignal>
@@ -22,6 +23,11 @@
 // pin from the rt_sched.* parameters. ROS-free like rt_memory (see rt_sched.hpp);
 // this file logs its result. See test/test_rt_sched.cpp.
 #include "eli_cs_robot_driver/rt_sched.hpp"
+// Real-time TIMEBASE of the control loop: the CLOCK_MONOTONIC deadline grid,
+// overrun classification/resync, and the lock-free PeriodStats the loop fills
+// for a reporter on the executor thread. ROS-free (see rt_timebase.hpp).
+// See test/test_rt_timebase.cpp.
+#include "eli_cs_robot_driver/rt_timebase.hpp"
 
 // Rely on a subclass of ControllerManager to intercept the pre-shutdown hook
 // and execute a workaround for a ROS2 Humble bug to ensure orderly shutdown at termination.
@@ -153,9 +159,66 @@ int main(int argc, char** argv) {
         rt_param_or_default<int>(*controller_manager, "rt_sched.priority", rts::kDefaultPriority);
     const int rt_cpu = rt_param_or_default<int>(*controller_manager, "rt_sched.cpu", rts::kNoCpuPin);
 
+    // Control loop timebase. The nominal period comes from the controller
+    // manager's update_rate; the loop schedules on CLOCK_MONOTONIC (see the loop
+    // below and rt_timebase.hpp).
+    namespace rttb = ELITE_CS_ROBOT_ROS_DRIVER::rt_timebase;
+    const int64_t period_ns = rttb::period_ns_from_rate(controller_manager->get_update_rate());
+    if (period_ns <= 0) {
+        RCLCPP_FATAL(controller_manager->get_logger(),
+            "update_rate %u Hz is invalid; control loop not started", controller_manager->get_update_rate());
+        rclcpp::shutdown();
+        return 1;
+    }
+
+    // Period statistics: written by the loop thread once per cycle, read by the
+    // reporter below on the executor thread (see rt_timebase.hpp for the
+    // threading model). Owned here so both sides can reach it.
+    auto period_stats = std::make_shared<rttb::PeriodStats>();
+
+    // Timing report, OFF the loop thread: a wall timer on the controller manager
+    // node (so it runs in executor->spin(), never on the SCHED_FIFO loop)
+    // snapshots PeriodStats every rt_timebase.report_interval_sec seconds and
+    // logs one INFO line with the measured period's min/mean/max/std, the
+    // overrun and clamp counts, and the largest lateness since the previous
+    // report. Counters are monotonic and differenced here; the min/max window is
+    // restarted by asking the loop for a new window (request_window_reset). A
+    // value <= 0 disables the report; the loop keeps recording either way.
+    const double report_interval_sec = rt_param_or_default<double>(*controller_manager,
+        "rt_timebase.report_interval_sec", rttb::kDefaultReportIntervalSeconds);
+    rclcpp::TimerBase::SharedPtr timebase_report_timer;
+    if (report_interval_sec > 0.0) {
+        struct ReporterState {
+            rttb::Snapshot previous;
+            uint32_t expected_window = 0;
+        };
+        auto state = std::make_shared<ReporterState>();
+        timebase_report_timer = controller_manager->create_wall_timer(
+            std::chrono::duration<double>(report_interval_sec),
+            [controller_manager, period_stats, state, period_ns]() {
+                // Snapshot, then IMMEDIATELY open the next extremes window, so the
+                // cycles the loop records while this callback formats and writes
+                // the log line (milliseconds when the launch stdout pipe is busy)
+                // belong to the window they are counted in. The only remaining gap
+                // is a record() in flight between the two calls: at most one cycle.
+                const rttb::Snapshot current = period_stats->snapshot();
+                const uint32_t reported_window = state->expected_window;
+                state->expected_window = period_stats->request_window_reset();
+                const rttb::Report report = rttb::summarize(state->previous, current, reported_window);
+                state->previous = current;
+                RCLCPP_INFO(controller_manager->get_logger(), "Control loop timing: %s",
+                    rttb::describe(report, period_ns).c_str());
+            });
+        RCLCPP_INFO(controller_manager->get_logger(),
+            "Control loop timing report: every %.0fs (rt_timebase.report_interval_sec)", report_interval_sec);
+    } else {
+        RCLCPP_INFO(controller_manager->get_logger(),
+            "Control loop timing report: disabled (rt_timebase.report_interval_sec <= 0)");
+    }
+
     // Control loop thread
     std::thread control_loop([controller_manager, heap_reserve_bytes, log_interval_sec,
-                              rt_priority, rt_cpu]() {
+                              rt_priority, rt_cpu, period_stats, period_ns]() {
         // Pin (if asked) and switch this thread to SCHED_FIFO. configure_realtime_sched
         // never aborts: a bad tuning value or a refused syscall degrades to the
         // old behaviour and is logged, it must not take the drivers down.
@@ -211,35 +274,66 @@ int main(int argc, char** argv) {
         }
         rt::RtMemoryMonitor memory_monitor(controller_manager->get_update_rate(), log_interval_sec);
 
-        // for calculating sleep time
-        auto const period = std::chrono::nanoseconds(1'000'000'000 / controller_manager->get_update_rate());
-        auto const cm_now = std::chrono::nanoseconds(controller_manager->now().nanoseconds());
-        std::chrono::time_point<std::chrono::system_clock, std::chrono::nanoseconds> next_iteration_time{cm_now};
-
+        // The cycle grid lives on CLOCK_MONOTONIC and every sleep is to an
+        // ABSOLUTE deadline (clock_nanosleep TIMER_ABSTIME). This replaced a
+        // std::chrono::system_clock grid + std::this_thread::sleep_until, which
+        // libstdc++ runs as `while (now < t) sleep_for(t - now)`: an NTP step of
+        // -0.894 s on the robot stretched one cycle by 0.9 s (the EtherCAT drives'
+        // 500 ms watchdog tripped) and the loop then ran the missed cycles back to
+        // back to catch up. The wall clock cannot move a monotonic deadline, and
+        // the overrun rule below never bursts. rt_timebase.hpp has the policy;
+        // controller_manager->now() is still used for the ROS time stamps.
+        namespace rttb = ELITE_CS_ROBOT_ROS_DRIVER::rt_timebase;
         RCLCPP_INFO(controller_manager->get_logger(),
-            "Period (ns): %lu Update Rate: %u (Hz)", period.count(), controller_manager->get_update_rate());
+            "Period (ns): %ld Update Rate: %u (Hz), CLOCK_MONOTONIC absolute deadlines",
+            static_cast<long>(period_ns), controller_manager->get_update_rate());
 
-        // for calculating the measured period of the loop
-        rclcpp::Time previous_time = controller_manager->now();
+        // First deadline one period from now; the previous wake-up is "now" so the
+        // first measured period is close to nominal.
+        timespec previous_wake = rttb::now_monotonic();
+        timespec deadline = rttb::next_deadline(previous_wake, period_ns);
 
         while (rclcpp::ok()) {
             try {
-                // calculate measured period
-                auto const current_time = controller_manager->now();
-                auto const measured_period = current_time - previous_time;
-                previous_time = current_time;
+                // Sleep to the absolute deadline. The return code is deliberately
+                // not logged here (nothing on this thread logs per cycle); with
+                // valid arguments clock_nanosleep only ever returns 0 or EINTR,
+                // and EINTR is retried inside.
+                rttb::sleep_until_monotonic(deadline);
+                const timespec wake = rttb::now_monotonic();
 
-                // execute update loop
+                // Classify the wake-up and pick the next deadline: on time or late
+                // (< one period) advances the grid by exactly one period; an
+                // overrun (>= one period late) restarts the grid from now, so the
+                // missed cycles are dropped, not run back to back.
+                const rttb::Step step = rttb::step(deadline, wake, period_ns);
+                deadline = step.next_deadline;
+
+                // The measured period is the monotonic gap between wake-ups: the
+                // real dt the controllers experienced, immune to wall-clock steps.
+                // The controller manager receives it clamped to [0, 10 x period]
+                // so a stall never feeds a multi-second dt into an integrator; the
+                // clamp is counted with the overruns.
+                const int64_t wake_gap_ns = rttb::diff_ns(wake, previous_wake);
+                previous_wake = wake;
+                const rttb::ClampedPeriod dt = rttb::clamp_measured_period(wake_gap_ns, period_ns);
+                const rclcpp::Duration measured_period = rclcpp::Duration::from_nanoseconds(dt.ns);
+
+                // Lock-free, wait-free; read by the reporter on the executor thread.
+                rttb::CycleSample sample;
+                sample.period_ns = wake_gap_ns;
+                sample.lateness_ns = step.wake.lateness_ns;
+                sample.overrun = step.wake.verdict == rttb::Verdict::Overrun;
+                sample.clamped = dt.clamped;
+                period_stats->record(sample);
+
+                // execute update loop (ROS time stamps from the controller manager clock)
                 controller_manager->read(controller_manager->now(), measured_period);
                 controller_manager->update(controller_manager->now(), measured_period);
                 controller_manager->write(controller_manager->now(), measured_period);
 
                 // Emit a fault/memory report at most once per log interval.
                 memory_monitor.tick(controller_manager->get_logger());
-
-                // wait until we hit the end of the period
-                next_iteration_time += period;
-                std::this_thread::sleep_until(next_iteration_time);
 
             } catch (const std::exception& ex) {
                 RCLCPP_FATAL_STREAM(rclcpp::get_logger("controller_manager"), ex.what());
