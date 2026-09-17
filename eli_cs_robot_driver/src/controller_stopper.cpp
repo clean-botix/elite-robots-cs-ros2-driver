@@ -126,11 +126,53 @@ void ControllerStopper::findAndStopControllers() {
             request_switch_controller->strictness = request_switch_controller->STRICT;
             if (!stopped_controllers_.empty()) {
                 request_switch_controller->deactivate_controllers = stopped_controllers_;
-                auto future = controller_manager_srv_->async_send_request(request_switch_controller, callback_switch_controller);
+                // A controller still holding a trajectory goal refuses to deactivate, so the goal
+                // has to go first -- see cancelTrajectoryGoals.
+                cancelTrajectoryGoals(
+                    stopped_controllers_, [this, request_switch_controller, callback_switch_controller]() {
+                        controller_manager_srv_->async_send_request(request_switch_controller, callback_switch_controller);
+                    });
             }
         };
 
     auto future = controller_list_srv_->async_send_request(request_list_controllers, callback_list_controller);
+}
+
+void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& controllers,
+                                              std::function<void()> on_cancelled) {
+    std::vector<rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::SharedPtr> to_cancel;
+    for (const auto& controller : controllers) {
+        auto it = trajectory_action_clients_.find(controller);
+        if (it == trajectory_action_clients_.end()) {
+            it = trajectory_action_clients_
+                     .emplace(controller, rclcpp_action::create_client<control_msgs::action::FollowJointTrajectory>(
+                                              node_, controller + "/follow_joint_trajectory"))
+                     .first;
+        }
+        // Not every stoppable controller runs a trajectory action; those have no server to ask
+        if (it->second->action_server_is_ready()) {
+            to_cancel.push_back(it->second);
+        }
+    }
+
+    if (to_cancel.empty()) {
+        on_cancelled();
+        return;
+    }
+
+    // The switch runs once, after the last controller answers. Cancelling is best effort, so the
+    // count is decremented on every response whatever it says -- a refused cancel must not strand
+    // the switch that follows.
+    auto pending = std::make_shared<std::size_t>(to_cancel.size());
+    for (const auto& client : to_cancel) {
+        client->async_cancel_all_goals(
+            [pending, on_cancelled](
+                const rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::CancelResponse::SharedPtr) {
+                if (--(*pending) == 0) {
+                    on_cancelled();
+                }
+            });
+    }
 }
 
 void ControllerStopper::startControllers() {

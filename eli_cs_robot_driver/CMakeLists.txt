@@ -18,6 +18,8 @@ find_package(rclcpp_lifecycle REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(controller_manager REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
+find_package(control_msgs REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(backward_ros REQUIRED)
 find_package(elite-cs-series-sdk REQUIRED)
 find_package(realtime_tools REQUIRED)
@@ -33,7 +35,9 @@ set(
   std_srvs
   rclcpp 
   rclcpp_components
+  rclcpp_action
   controller_manager_msgs
+  control_msgs
 )
 
 # Add dashboard client component
