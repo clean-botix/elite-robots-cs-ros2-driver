@@ -31,6 +31,8 @@
   <depend>hardware_interface</depend>
   <depend>pluginlib</depend>
   <depend>controller_manager_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>rclcpp_action</depend>
   <depend>controller_manager</depend>
   <depend>realtime_tools</depend>
   <depend>launch</depend>
