@@ -12,6 +12,7 @@
 // action client was created at the moment of the stop and had not discovered the server yet,
 // so the cancel was skipped and everything else behaved normally.
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -70,6 +71,9 @@ class FakeRobot {
             "controller_manager/list_controllers",
             [this](const controller_manager_msgs::srv::ListControllers::Request::SharedPtr,
                    controller_manager_msgs::srv::ListControllers::Response::SharedPtr response) {
+                if (!controllers_loaded_.load()) {
+                    return;
+                }
                 controller_manager_msgs::msg::ControllerState trajectory;
                 trajectory.name = TRAJECTORY_CONTROLLER;
                 trajectory.state = "active";
@@ -122,6 +126,12 @@ class FakeRobot {
         task_running_pub_->publish(msg);
     }
 
+    // The spawners load the controllers well after this node starts; until then the controller
+    // manager lists nothing.
+    void loadControllers() { controllers_loaded_.store(true); }
+
+    void hideControllers() { controllers_loaded_.store(false); }
+
     bool holdsGoal() {
         std::lock_guard<std::mutex> lock(goal_mutex_);
         return goal_handle_ != nullptr;
@@ -137,13 +147,16 @@ class FakeRobot {
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr task_running_pub_;
     std::mutex goal_mutex_;
     std::shared_ptr<rclcpp_action::ServerGoalHandle<FollowJointTrajectory>> goal_handle_;
+    std::atomic<bool> controllers_loaded_{true};
 };
 
 class ControllerStopperTest : public ::testing::Test {
    protected:
     void SetUp() override {
         robot_ = std::make_unique<FakeRobot>(log_);
+        client_node_ = std::make_shared<rclcpp::Node>("trajectory_goal_sender");
         robot_executor_.add_node(robot_->node());
+        robot_executor_.add_node(client_node_);
         robot_thread_ = std::thread([this]() { robot_executor_.spin(); });
 
         rclcpp::NodeOptions options;
@@ -168,7 +181,7 @@ class ControllerStopperTest : public ::testing::Test {
     // A trajectory is running when the arm stops; without a live goal there is nothing to cancel
     void sendTrajectoryGoal() {
         auto client = rclcpp_action::create_client<FollowJointTrajectory>(
-            stopper_node_, std::string(TRAJECTORY_CONTROLLER) + "/follow_joint_trajectory");
+            client_node_, std::string(TRAJECTORY_CONTROLLER) + "/follow_joint_trajectory");
         ASSERT_TRUE(client->wait_for_action_server(10s)) << "fake trajectory action server never came up";
         client->async_send_goal(FollowJointTrajectory::Goal());
         ASSERT_TRUE(spinUntil([this]() { return robot_->holdsGoal(); }, 10s)) << "goal never reached the server";
@@ -191,10 +204,86 @@ class ControllerStopperTest : public ::testing::Test {
     std::unique_ptr<FakeRobot> robot_;
     rclcpp::executors::SingleThreadedExecutor robot_executor_;
     std::thread robot_thread_;
+    rclcpp::Node::SharedPtr client_node_;
     rclcpp::Node::SharedPtr stopper_node_;
     std::unique_ptr<ControllerStopper> stopper_;
     rclcpp_action::Client<FollowJointTrajectory>::SharedPtr goal_client_;
 };
+
+// Boot order on the robot: this node comes up with the driver, before the spawners have loaded
+// any controller, so the first listing is empty. A client created only at that moment covers
+// nothing, and a client created at the stop has not discovered its server in time.
+class ControllerStopperLateControllersTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        robot_ = std::make_unique<FakeRobot>(log_);
+        robot_->hideControllers();
+        client_node_ = std::make_shared<rclcpp::Node>("late_trajectory_goal_sender");
+        robot_executor_.add_node(robot_->node());
+        robot_executor_.add_node(client_node_);
+        robot_thread_ = std::thread([this]() { robot_executor_.spin(); });
+
+        rclcpp::NodeOptions options;
+        options.parameter_overrides(
+            {rclcpp::Parameter("consistent_controllers", std::vector<std::string>{CONSISTENT_CONTROLLER})});
+        stopper_node_ = std::make_shared<rclcpp::Node>("controller_stopper_late_controllers", options);
+        stopper_ = std::make_unique<ControllerStopper>(stopper_node_, false);
+    }
+
+    void TearDown() override {
+        robot_executor_.cancel();
+        if (robot_thread_.joinable()) {
+            robot_thread_.join();
+        }
+        stopper_.reset();
+    }
+
+    bool spinFor(std::chrono::nanoseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        while (std::chrono::steady_clock::now() < deadline) {
+            rclcpp::spin_some(stopper_node_);
+            std::this_thread::sleep_for(10ms);
+        }
+        return true;
+    }
+
+    bool spinUntil(const std::function<bool()>& done, std::chrono::nanoseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (done()) {
+                return true;
+            }
+            rclcpp::spin_some(stopper_node_);
+            std::this_thread::sleep_for(10ms);
+        }
+        return done();
+    }
+
+    EventLog log_;
+    std::unique_ptr<FakeRobot> robot_;
+    rclcpp::executors::SingleThreadedExecutor robot_executor_;
+    std::thread robot_thread_;
+    rclcpp::Node::SharedPtr client_node_;
+    rclcpp::Node::SharedPtr stopper_node_;
+    std::unique_ptr<ControllerStopper> stopper_;
+};
+
+TEST_F(ControllerStopperLateControllersTest, CancelsAControllerThatLoadedAfterStartup) {
+    robot_->loadControllers();
+    // Long enough for the repeating prime to notice them and for discovery to settle
+    spinFor(6s);
+
+    auto client = rclcpp_action::create_client<FollowJointTrajectory>(
+        client_node_, std::string(TRAJECTORY_CONTROLLER) + "/follow_joint_trajectory");
+    ASSERT_TRUE(client->wait_for_action_server(10s));
+    client->async_send_goal(FollowJointTrajectory::Goal());
+    ASSERT_TRUE(spinUntil([this]() { return robot_->holdsGoal(); }, 10s)) << "goal never reached the server";
+
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("cancel"); }, 10s))
+        << "a controller loaded after this node started was never given a cancel client";
+}
 
 TEST_F(ControllerStopperTest, CancelsTheTrajectoryGoalWhenTheRobotTaskStops) {
     robot_->publishTaskRunning(false);

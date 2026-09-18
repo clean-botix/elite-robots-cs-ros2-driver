@@ -51,6 +51,8 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
     consistent_controllers_ = node_->declare_parameter<std::vector<std::string>>("consistent_controllers");
 
     primeTrajectoryActionClients();
+    // The controllers are not loaded yet at this point, so keep looking until they are
+    prime_timer_ = node_->create_wall_timer(std::chrono::seconds(2), [this]() { primeTrajectoryActionClients(); });
 
     // Get robot mode and if robot is power off, stop controller on startup
     auto robot_mode_request = std::make_shared<eli_common_interface::srv::GetRobotMode::Request>();
@@ -142,14 +144,14 @@ void ControllerStopper::findAndStopControllers() {
 
 void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& controllers,
                                               std::function<void()> on_cancelled) {
+    // Only clients primed earlier are usable. One created here would not have discovered its
+    // server yet, would report not ready, and would be skipped -- which is indistinguishable from
+    // having no cancel at all, so there is nothing to gain by making one.
     std::vector<rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::SharedPtr> to_cancel;
     for (const auto& controller : controllers) {
         auto it = trajectory_action_clients_.find(controller);
         if (it == trajectory_action_clients_.end()) {
-            it = trajectory_action_clients_
-                     .emplace(controller, rclcpp_action::create_client<control_msgs::action::FollowJointTrajectory>(
-                                              node_, controller + "/follow_joint_trajectory"))
-                     .first;
+            continue;
         }
         // Not every stoppable controller runs a trajectory action; those have no server to ask
         if (it->second->action_server_is_ready()) {
@@ -183,23 +185,28 @@ void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& co
 }
 
 void ControllerStopper::primeTrajectoryActionClients() {
+    // Asynchronous because this also runs from a timer, and spinning the node from inside its own
+    // callback would re-enter the executor.
     auto request = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
-    auto future = controller_list_srv_->async_send_request(request);
-    if (rclcpp::spin_until_future_complete(node_, future) != rclcpp::FutureReturnCode::SUCCESS) {
-        RCLCPP_WARN(rclcpp::get_logger("Controller stopper"),
-                    "Could not list controllers; trajectory cancel clients will be created on demand");
-        return;
-    }
-    // Held in a local: `future.get()` hands back a shared_ptr by value, and binding the range
-    // directly to it frees the response before the first iteration.
-    auto response = future.get();
-    for (const auto& controller : response->controller) {
-        trajectory_action_clients_.emplace(
-            controller.name, rclcpp_action::create_client<control_msgs::action::FollowJointTrajectory>(
-                                 node_, controller.name + "/follow_joint_trajectory"));
-    }
-    RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "Prepared trajectory cancel clients for %zu controller(s)",
-                trajectory_action_clients_.size());
+    controller_list_srv_->async_send_request(
+        request, [this](rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedFuture future) {
+            auto response = future.get();
+            std::size_t added = 0;
+            for (const auto& controller : response->controller) {
+                if (trajectory_action_clients_.count(controller.name) > 0) {
+                    continue;
+                }
+                trajectory_action_clients_.emplace(
+                    controller.name, rclcpp_action::create_client<control_msgs::action::FollowJointTrajectory>(
+                                         node_, controller.name + "/follow_joint_trajectory"));
+                ++added;
+            }
+            if (added > 0) {
+                RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
+                            "Prepared trajectory cancel clients for %zu new controller(s), %zu total", added,
+                            trajectory_action_clients_.size());
+            }
+        });
 }
 
 void ControllerStopper::startControllers() {
