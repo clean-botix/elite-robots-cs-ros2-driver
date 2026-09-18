@@ -51,6 +51,16 @@ class ControllerStopper {
     void cancelTrajectoryGoals(const std::vector<std::string>& controllers, std::function<void()> on_cancelled);
 
     /*!
+     * \brief Creates the trajectory action clients up front, one per known controller.
+     *
+     * Discovery is why this cannot wait until a stop arrives. A client created at that moment has
+     * not found its server yet, so it reports not ready, the cancel is skipped, and the deactivate
+     * fails exactly as it would with no cancel at all. There is no time to wait for discovery
+     * then: the goal reaches its terminal state a few hundred milliseconds after the stop.
+     */
+    void primeTrajectoryActionClients();
+
+    /*!
      * \brief Starts the controllers stored in stopped_controllers_.
      *
      */
