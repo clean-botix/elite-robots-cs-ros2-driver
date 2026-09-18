@@ -247,6 +247,20 @@ if(BUILD_TESTING)
   target_include_directories(test_rt_sched PRIVATE include)
   ament_target_dependencies(test_rt_sched realtime_tools)
 
+  # The trajectory goal must be canceled before the controllers are deactivated, or the
+  # controller refuses the switch and the goal outlives the stop reporting success.
+  ament_add_gtest(test_controller_stopper test/test_controller_stopper.cpp src/controller_stopper.cpp)
+  target_include_directories(test_controller_stopper PRIVATE include)
+  ament_target_dependencies(
+    test_controller_stopper
+    rclcpp
+    rclcpp_action
+    control_msgs
+    controller_manager_msgs
+    eli_common_interface
+    std_srvs
+  )
+
   # Regression test for elite_control.launch.py's bool-typed launch parameters.
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_elite_control_launch test/test_elite_control_launch.py)
