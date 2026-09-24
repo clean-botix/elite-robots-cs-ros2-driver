@@ -23,7 +23,7 @@ mesh_files:
     collision:
       mesh:
         package: eli_cs_robot_description
-        path: meshes/cs612/collision/shoulder_simple.stl
+        path: meshes/cs612/collision/shoulder_simple_090926.stl
 
   upperarm:
     visual:
