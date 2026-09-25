@@ -167,6 +167,7 @@ add_executable(
   src/rt_memory.cpp
   src/rt_memory_reporting.cpp
   src/rt_sched.cpp
+  src/rt_timebase.cpp
 )
 ament_target_dependencies(
   eli_ros2_control_node
@@ -242,6 +243,13 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rt_sched test/test_rt_sched.cpp src/rt_sched.cpp)
   target_include_directories(test_rt_sched PRIVATE include)
   ament_target_dependencies(test_rt_sched realtime_tools)
+
+  # Unit tests for the control loop TIMEBASE helpers (rt_timebase.hpp): grid
+  # arithmetic, wake-up classification and the overrun resync rule, the
+  # measured-period clamp, PeriodStats (including a torn-read check against a
+  # concurrent writer) and the reporter summary line.
+  ament_add_gtest(test_rt_timebase test/test_rt_timebase.cpp src/rt_timebase.cpp)
+  target_include_directories(test_rt_timebase PRIVATE include)
 
   # Regression test for elite_control.launch.py's bool-typed launch parameters.
   find_package(ament_cmake_pytest REQUIRED)
