@@ -11,16 +11,28 @@
 // `while (now < t) sleep_for(t - now)`, so a backward wall-clock step (an NTP
 // correction on the robot: -0.894 s) stretched one cycle by the size of the step,
 // which tripped the EtherCAT drives' 500 ms watchdog. Afterwards the loop ran the
-// missed cycles back to back to catch up with the grid. Two rules fix both:
-//   1. The grid lives on CLOCK_MONOTONIC and each cycle sleeps to an ABSOLUTE
-//      deadline with clock_nanosleep(TIMER_ABSTIME). A wall-clock STEP cannot
-//      move it and there is no per-cycle drift from relative sleeps. (NTP
-//      frequency slew does reach CLOCK_MONOTONIC on Linux, capped at 500 ppm =
-//      10 us per 20 ms cycle, smooth, and it reached the old clock identically.)
+// missed cycles back to back to catch up with the grid. Three rules fix this:
+//   1. The grid is the set of multiples of the period on CLOCK_MONOTONIC_RAW, and
+//      each cycle sleeps to an ABSOLUTE deadline on it. A wall-clock STEP cannot
+//      move it and there is no per-cycle drift from relative sleeps. RAW rather
+//      than CLOCK_MONOTONIC because NTP's frequency slew reaches CLOCK_MONOTONIC
+//      on Linux (up to 500 ppm) but not RAW, and the EtherCAT hose reel bus keeps
+//      its distributed clocks on RAW (ethercat_interface/dc_app_time.hpp): the
+//      drives' SYNC0 interrupts fire on multiples of the same period on the same
+//      clock, so a loop on this grid sends every frame at a FIXED phase before
+//      SYNC0. A loop on any other clock drifts against that grid by the slew and
+//      its frames sweep through SYNC0 once every few minutes. The kernel cannot
+//      sleep on RAW, so each raw deadline is translated to a CLOCK_MONOTONIC one
+//      right before the sleep (sleep_until_raw); the translation error is the slew
+//      over one sleep, microseconds, and it never accumulates.
 //   2. A wake-up a full period or more late is an OVERRUN: the loop counts it,
-//      records how late it was, and moves the grid to now + period. It never
-//      bursts to catch up. A wake-up less than a period late is merely LATE and
-//      the grid stays where it was.
+//      records how late it was, and resumes on the next grid point at least half
+//      a period away (resync_to_grid), so the missed cycles are dropped and the
+//      phase against the bus is kept. It never bursts to catch up. A wake-up less
+//      than a period late is merely LATE and the grid stays where it was.
+//   3. The nominal period must be the same number the EtherCAT master uses for
+//      the SYNC0 cycle (the hose reel URDF's control_frequency). EcMaster checks
+//      the loop's real period against it after activation and logs a mismatch.
 // The loop thread only updates PeriodStats (relaxed atomics, single writer);
 // summarising and logging happen on a wall timer on the executor thread.
 #pragma once
@@ -46,7 +58,7 @@ inline constexpr int64_t kMaxMeasuredPeriods = 10;
 inline constexpr double kDefaultReportIntervalSeconds = 30.0;
 
 // ---------------------------------------------------------------------------
-// timespec arithmetic (CLOCK_MONOTONIC values). All pure.
+// timespec arithmetic (values of one clock, CLOCK_MONOTONIC_RAW for the grid). All pure.
 
 // Nominal period for an update rate; 0 Hz maps to 0 ns (caller must reject it).
 inline int64_t period_ns_from_rate(unsigned update_rate_hz) {
@@ -62,10 +74,28 @@ inline int64_t diff_ns(const timespec& a, const timespec& b) {
            (static_cast<int64_t>(a.tv_nsec) - static_cast<int64_t>(b.tv_nsec));
 }
 
+// timespec <-> nanoseconds since the clock's epoch (int64: fine for ~292 years).
+inline int64_t to_ns(const timespec& t) {
+    return static_cast<int64_t>(t.tv_sec) * kNsPerSec + static_cast<int64_t>(t.tv_nsec);
+}
+inline timespec from_ns(int64_t ns) {
+    timespec t{};
+    t.tv_sec = static_cast<time_t>(ns / kNsPerSec);
+    t.tv_nsec = static_cast<long>(ns % kNsPerSec);
+    return t;
+}
+
 // The grid point one period after `prev`.
 inline timespec next_deadline(const timespec& prev, int64_t period_ns) {
     return add_ns(prev, period_ns);
 }
+
+// The grid point (a multiple of period_ns on the clock) the loop should resume
+// on after `now`: the first one at least half a period away, so the cycle after
+// a stall is never a near-zero dt for the controllers and the loop's phase on the
+// grid is the same as before the stall. Used for the first deadline and after an
+// overrun. period_ns <= 0 returns now.
+timespec resync_to_grid(const timespec& now, int64_t period_ns);
 
 // ---------------------------------------------------------------------------
 // Wake-up classification.
@@ -73,7 +103,7 @@ inline timespec next_deadline(const timespec& prev, int64_t period_ns) {
 enum class Verdict {
     OnTime,   // woke at or before the deadline (lateness_ns <= 0)
     Late,     // 0 < lateness_ns < period_ns; grid unchanged
-    Overrun,  // lateness_ns >= period_ns; grid resynchronised to now
+    Overrun,  // lateness_ns >= period_ns; loop resumes on the next grid point (resync_to_grid)
 };
 
 struct Classification {
@@ -86,8 +116,9 @@ Classification classify(const timespec& now, const timespec& deadline, int64_t p
 
 // One loop iteration's scheduling decision: classify the wake-up and produce the
 // deadline for the next cycle. OnTime and Late advance the grid by exactly one
-// period; Overrun restarts it from `now`, so the missed cycles are dropped
-// rather than run back to back (design decision 2).
+// period; Overrun resumes on the next grid point (resync_to_grid), so the missed
+// cycles are dropped rather than run back to back and the phase on the grid is
+// kept (design decision 2).
 struct Step {
     Classification wake;
     timespec next_deadline{};
@@ -103,10 +134,24 @@ struct ClampedPeriod {
 ClampedPeriod clamp_measured_period(int64_t measured_ns, int64_t period_ns);
 
 // ---------------------------------------------------------------------------
-// Effectful wrappers over the two syscalls the loop needs (in rt_timebase.cpp).
+// Effectful wrappers over the syscalls the loop needs (in rt_timebase.cpp).
 
-// clock_gettime(CLOCK_MONOTONIC). A vDSO call on Linux: no syscall, ~20-40 ns.
+// clock_gettime(CLOCK_MONOTONIC_RAW): the loop's clock. A vDSO call on Linux.
+timespec now_monotonic_raw();
+
+// clock_gettime(CLOCK_MONOTONIC). Only needed to translate a raw deadline into
+// something the kernel can sleep on (sleep_until_raw).
 timespec now_monotonic();
+
+// Sleep until `deadline_raw` on CLOCK_MONOTONIC_RAW. clock_nanosleep rejects
+// that clock (EINVAL), so the remaining time is measured on RAW and the sleep is
+// an absolute clock_nanosleep on CLOCK_MONOTONIC for that long; the two clocks
+// differ in rate by the NTP frequency correction (<= 500 ppm), so the wake-up is
+// off by at most that fraction of the remaining sleep (10 us in 20 ms; ~1 us at
+// the tens of ppm seen on the robots) and may be that much early on the raw
+// clock. Retries on EINTR. Returns 0 or the errno of a non-EINTR failure; never
+// throws. A deadline already in the past returns at once.
+int sleep_until_raw(const timespec& deadline_raw);
 
 // clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, deadline). Retries on EINTR
 // (an absolute deadline makes the retry exact). Returns 0 or the errno of a

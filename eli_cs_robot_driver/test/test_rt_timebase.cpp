@@ -1,8 +1,9 @@
 // Unit tests for the control loop TIMEBASE helpers in rt_timebase.hpp: grid
 // arithmetic, wake-up classification and the overrun resync rule, the measured
 // period clamp, the single-writer PeriodStats accumulator (including a torn-read
-// check against a concurrent writer), the reporter summary, and the two
-// CLOCK_MONOTONIC wrappers. No rclcpp dependency, like rt_timebase.hpp/.cpp.
+// check against a concurrent writer), the reporter summary, and the clock
+// wrappers including the raw -> monotonic sleep translation. No rclcpp
+// dependency, like rt_timebase.hpp/.cpp.
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -137,16 +138,73 @@ TEST(Step, LateKeepsTheOriginalGrid) {
     EXPECT_EQ(tb::diff_ns(s.next_deadline, now), 15 * kMs);
 }
 
-TEST(Step, OverrunResyncsTheGridToNowPlusOnePeriod) {
-    // Stalled 100 ms: five cycles were missed. The next deadline is one period
-    // after the stall ended, not five back-to-back catch-up cycles.
+TEST(ToFromNs, RoundTripsAndNormalises) {
+    const timespec t = ts(12, 345'678'901);
+    EXPECT_EQ(tb::to_ns(t), 12 * tb::kNsPerSec + 345'678'901);
+    const timespec back = tb::from_ns(tb::to_ns(t));
+    EXPECT_EQ(back.tv_sec, 12);
+    EXPECT_EQ(back.tv_nsec, 345'678'901);
+}
+
+// --- resync_to_grid: the grid is multiples of the period on the clock -----------
+
+TEST(ResyncToGrid, OnAGridPointResumesOnePeriodLater) {
+    // 10 s is a multiple of 20 ms; the first grid point >= now + 10 ms is now + 20 ms.
+    const timespec now = ts(10, 0);
+    const timespec next = tb::resync_to_grid(now, kPeriod50Hz);
+    EXPECT_EQ(tb::diff_ns(next, now), kPeriod50Hz);
+    EXPECT_EQ(tb::to_ns(next) % kPeriod50Hz, 0);
+}
+
+TEST(ResyncToGrid, JustPastAGridPointWaitsForTheNextOne) {
+    // 1 ms past a grid point: the next point is 19 ms away, more than half a period.
+    const timespec now = tb::add_ns(ts(10, 0), 1 * kMs);
+    const timespec next = tb::resync_to_grid(now, kPeriod50Hz);
+    EXPECT_EQ(tb::diff_ns(next, now), 19 * kMs);
+    EXPECT_EQ(tb::to_ns(next) % kPeriod50Hz, 0);
+}
+
+TEST(ResyncToGrid, WithinHalfAPeriodOfAGridPointSkipsIt) {
+    // 15 ms past a grid point: the next point is only 5 ms away, so the one after
+    // it is chosen (25 ms). The cycle after a stall is never a near-zero dt.
+    const timespec now = tb::add_ns(ts(10, 0), 15 * kMs);
+    const timespec next = tb::resync_to_grid(now, kPeriod50Hz);
+    EXPECT_EQ(tb::diff_ns(next, now), 25 * kMs);
+    EXPECT_EQ(tb::to_ns(next) % kPeriod50Hz, 0);
+}
+
+TEST(ResyncToGrid, ExactlyHalfAPeriodBeforeAGridPointTakesIt) {
+    const timespec now = tb::add_ns(ts(10, 0), 10 * kMs);
+    EXPECT_EQ(tb::diff_ns(tb::resync_to_grid(now, kPeriod50Hz), now), 10 * kMs);
+}
+
+TEST(ResyncToGrid, ZeroPeriodReturnsNow) {
+    const timespec now = ts(10, 7);
+    EXPECT_EQ(tb::diff_ns(tb::resync_to_grid(now, 0), now), 0);
+}
+
+TEST(Step, OverrunResumesOnTheNextGridPoint) {
+    // Stalled 100 ms from a grid point: five cycles were missed. The next
+    // deadline is the grid point one period after the stall ended (the stall
+    // ended on the grid), not five back-to-back catch-up cycles.
     const timespec d = ts(10, 0);
     const timespec now = tb::add_ns(d, 100 * kMs);
     const auto s = tb::step(d, now, kPeriod50Hz);
     EXPECT_EQ(s.wake.verdict, tb::Verdict::Overrun);
     EXPECT_EQ(s.wake.lateness_ns, 100 * kMs);
     EXPECT_EQ(tb::diff_ns(s.next_deadline, now), kPeriod50Hz);
-    EXPECT_GT(tb::diff_ns(s.next_deadline, d), 5 * kPeriod50Hz);
+    EXPECT_EQ(tb::to_ns(s.next_deadline) % kPeriod50Hz, 0);
+}
+
+TEST(Step, OverrunOffTheGridKeepsThePhase) {
+    // Stalled 103 ms: the loop resumes on a grid point (17 ms later), not at
+    // now + period (which would shift its phase against the bus by 3 ms for good).
+    const timespec d = ts(10, 0);
+    const timespec now = tb::add_ns(d, 103 * kMs);
+    const auto s = tb::step(d, now, kPeriod50Hz);
+    EXPECT_EQ(s.wake.verdict, tb::Verdict::Overrun);
+    EXPECT_EQ(tb::diff_ns(s.next_deadline, now), 17 * kMs);
+    EXPECT_EQ(tb::to_ns(s.next_deadline) % kPeriod50Hz, 0);
 }
 
 TEST(Step, ASimulatedStallProducesExactlyOneOverrunAndNoBurst) {
@@ -178,6 +236,7 @@ TEST(Step, ASimulatedStallProducesExactlyOneOverrunAndNoBurst) {
     }
     EXPECT_EQ(overruns, 1);
     EXPECT_EQ(min_gap, P);  // never two cycles closer than one period
+    EXPECT_EQ(tb::to_ns(deadline) % P, 0);  // and still on the grid afterwards
 }
 
 // --- clamp_measured_period ------------------------------------------------------
@@ -434,7 +493,7 @@ TEST(Describe, EmptyAndStaleWindowsSaySo) {
     EXPECT_NE(tb::describe(stale, kPeriod50Hz).find("extremes stale"), std::string::npos);
 }
 
-// --- CLOCK_MONOTONIC wrappers ---------------------------------------------------
+// --- clock wrappers -----------------------------------------------------------
 
 TEST(Monotonic, NowIsNormalisedAndAdvances) {
     const timespec a = tb::now_monotonic();
@@ -442,6 +501,46 @@ TEST(Monotonic, NowIsNormalisedAndAdvances) {
     EXPECT_LT(a.tv_nsec, tb::kNsPerSec);
     const timespec b = tb::now_monotonic();
     EXPECT_GE(tb::diff_ns(b, a), 0);
+}
+
+TEST(Raw, NowIsNormalisedAndAdvances) {
+    const timespec a = tb::now_monotonic_raw();
+    EXPECT_GE(a.tv_nsec, 0);
+    EXPECT_LT(a.tv_nsec, tb::kNsPerSec);
+    const timespec b = tb::now_monotonic_raw();
+    EXPECT_GE(tb::diff_ns(b, a), 0);
+}
+
+TEST(Raw, SleepUntilHonoursAnAbsoluteRawDeadline) {
+    // Not a latency test (CI is not real-time): the call returns success and
+    // wakes within a generous bound. The wake-up may be EARLY on the raw clock
+    // by the NTP slew over the sleep (<= 500 ppm of 5 ms = 2.5 us); allow 100 us.
+    const timespec start = tb::now_monotonic_raw();
+    const timespec deadline = tb::add_ns(start, 5 * kMs);
+    EXPECT_EQ(tb::sleep_until_raw(deadline), 0);
+    const timespec woke = tb::now_monotonic_raw();
+    EXPECT_GE(tb::diff_ns(woke, deadline), -100 * tb::kNsPerUs);
+    EXPECT_LT(tb::diff_ns(woke, start), 500 * kMs);
+}
+
+TEST(Raw, SleepUntilAPastDeadlineReturnsImmediately) {
+    const timespec start = tb::now_monotonic_raw();
+    EXPECT_EQ(tb::sleep_until_raw(tb::add_ns(start, -tb::kNsPerSec)), 0);
+    EXPECT_LT(tb::diff_ns(tb::now_monotonic_raw(), start), 100 * kMs);
+}
+
+TEST(Raw, AGridOfSleepsStaysOnTheGrid) {
+    // Five consecutive raw deadlines on a 5 ms grid: each wake-up lands at or
+    // just after its deadline and the deadlines themselves never drift.
+    const int64_t P = 5 * kMs;
+    timespec deadline = tb::resync_to_grid(tb::now_monotonic_raw(), P);
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_EQ(tb::sleep_until_raw(deadline), 0);
+        const timespec woke = tb::now_monotonic_raw();
+        EXPECT_GE(tb::diff_ns(woke, deadline), -100 * tb::kNsPerUs);
+        EXPECT_EQ(tb::to_ns(deadline) % P, 0);
+        deadline = tb::add_ns(deadline, P);
+    }
 }
 
 TEST(Monotonic, SleepUntilHonoursAnAbsoluteDeadline) {

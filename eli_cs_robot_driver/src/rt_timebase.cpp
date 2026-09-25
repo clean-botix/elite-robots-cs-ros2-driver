@@ -1,6 +1,7 @@
 // Real-time TIMEBASE helpers for the control loop (see rt_timebase.hpp): grid
-// arithmetic, wake-up classification, the two CLOCK_MONOTONIC syscall wrappers,
-// and the single-writer PeriodStats accumulator with its reporter-side summary.
+// arithmetic on CLOCK_MONOTONIC_RAW, wake-up classification, the clock syscall
+// wrappers (including the raw -> monotonic sleep translation), and the
+// single-writer PeriodStats accumulator with its reporter-side summary.
 // No rclcpp dependency.
 #include "eli_cs_robot_driver/rt_timebase.hpp"
 
@@ -44,14 +45,26 @@ Classification classify(const timespec& now, const timespec& deadline, int64_t p
     return c;
 }
 
+timespec resync_to_grid(const timespec& now, int64_t period_ns) {
+    if (period_ns <= 0) {
+        return now;
+    }
+    // First multiple of the period at or after now + period/2: at least half a
+    // period of sleep, at most one and a half, and always on the grid.
+    const int64_t earliest = to_ns(now) + period_ns / 2;
+    const int64_t k = (earliest + period_ns - 1) / period_ns;  // ceil for non-negative values
+    return from_ns(k * period_ns);
+}
+
 Step step(const timespec& deadline, const timespec& now, int64_t period_ns) {
     Step s{};
     s.wake = classify(now, deadline, period_ns);
-    // Overrun: the grid restarts from the moment the loop actually ran, so the
-    // next cycle is one period from now and the missed ones are dropped.
+    // Overrun: the loop resumes on the next grid point (at least half a period
+    // away), so the missed cycles are dropped and the phase on the grid is kept.
     // Otherwise the grid is untouched: a Late wake-up shortens the next sleep
     // and the loop is back on the original grid one cycle later.
-    s.next_deadline = (s.wake.verdict == Verdict::Overrun) ? add_ns(now, period_ns) : add_ns(deadline, period_ns);
+    s.next_deadline =
+        (s.wake.verdict == Verdict::Overrun) ? resync_to_grid(now, period_ns) : add_ns(deadline, period_ns);
     return s;
 }
 
@@ -73,10 +86,30 @@ ClampedPeriod clamp_measured_period(int64_t measured_ns, int64_t period_ns) {
 // ---------------------------------------------------------------------------
 // Syscall wrappers
 
+timespec now_monotonic_raw() {
+    timespec t{};
+    clock_gettime(CLOCK_MONOTONIC_RAW, &t);
+    return t;
+}
+
 timespec now_monotonic() {
     timespec t{};
     clock_gettime(CLOCK_MONOTONIC, &t);
     return t;
+}
+
+int sleep_until_raw(const timespec& deadline_raw) {
+    // Back-to-back reads of both clocks; the remaining sleep measured on RAW is
+    // applied as an absolute CLOCK_MONOTONIC deadline. Preemption between the
+    // two reads adds its length to this one wake-up only; nothing accumulates
+    // because the grid itself lives on the raw clock.
+    const timespec raw_now = now_monotonic_raw();
+    const timespec mono_now = now_monotonic();
+    const int64_t remaining_ns = diff_ns(deadline_raw, raw_now);
+    if (remaining_ns <= 0) {
+        return 0;
+    }
+    return sleep_until_monotonic(add_ns(mono_now, remaining_ns));
 }
 
 int sleep_until_monotonic(const timespec& deadline) {

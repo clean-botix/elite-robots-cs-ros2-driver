@@ -160,8 +160,8 @@ int main(int argc, char** argv) {
     const int rt_cpu = rt_param_or_default<int>(*controller_manager, "rt_sched.cpu", rts::kNoCpuPin);
 
     // Control loop timebase. The nominal period comes from the controller
-    // manager's update_rate; the loop schedules on CLOCK_MONOTONIC (see the loop
-    // below and rt_timebase.hpp).
+    // manager's update_rate; the loop schedules on the CLOCK_MONOTONIC_RAW period
+    // grid (see the loop below and rt_timebase.hpp).
     namespace rttb = ELITE_CS_ROBOT_ROS_DRIVER::rt_timebase;
     const int64_t period_ns = rttb::period_ns_from_rate(controller_manager->get_update_rate());
     if (period_ns <= 0) {
@@ -274,43 +274,48 @@ int main(int argc, char** argv) {
         }
         rt::RtMemoryMonitor memory_monitor(controller_manager->get_update_rate(), log_interval_sec);
 
-        // The cycle grid lives on CLOCK_MONOTONIC and every sleep is to an
-        // ABSOLUTE deadline (clock_nanosleep TIMER_ABSTIME). This replaced a
+        // The cycle grid is the set of multiples of the period on CLOCK_MONOTONIC_RAW
+        // and every sleep is to an ABSOLUTE deadline on it. This replaced a
         // std::chrono::system_clock grid + std::this_thread::sleep_until, which
         // libstdc++ runs as `while (now < t) sleep_for(t - now)`: an NTP step of
         // -0.894 s on the robot stretched one cycle by 0.9 s (the EtherCAT drives'
         // 500 ms watchdog tripped) and the loop then ran the missed cycles back to
-        // back to catch up. The wall clock cannot move a monotonic deadline, and
+        // back to catch up. Neither a wall-clock step nor NTP's frequency slew can
+        // move a raw deadline, the EtherCAT distributed clocks run on the same grid
+        // (so every frame leaves at a fixed phase before the drives' SYNC0), and
         // the overrun rule below never bursts. rt_timebase.hpp has the policy;
         // controller_manager->now() is still used for the ROS time stamps.
         namespace rttb = ELITE_CS_ROBOT_ROS_DRIVER::rt_timebase;
         RCLCPP_INFO(controller_manager->get_logger(),
-            "Period (ns): %ld Update Rate: %u (Hz), CLOCK_MONOTONIC absolute deadlines",
+            "Period (ns): %ld Update Rate: %u (Hz), CLOCK_MONOTONIC_RAW period grid, absolute deadlines",
             static_cast<long>(period_ns), controller_manager->get_update_rate());
 
-        // First deadline one period from now; the previous wake-up is "now" so the
-        // first measured period is close to nominal.
-        timespec previous_wake = rttb::now_monotonic();
-        timespec deadline = rttb::next_deadline(previous_wake, period_ns);
+        // First deadline: the next grid point at least half a period away; the
+        // previous wake-up is "now" so the first measured period is close to nominal.
+        timespec previous_wake = rttb::now_monotonic_raw();
+        timespec deadline = rttb::resync_to_grid(previous_wake, period_ns);
 
         while (rclcpp::ok()) {
             try {
-                // Sleep to the absolute deadline. The return code is deliberately
+                // Sleep to the absolute raw deadline (translated to CLOCK_MONOTONIC
+                // inside, see rt_timebase.hpp). The return code is deliberately
                 // not logged here (nothing on this thread logs per cycle); with
                 // valid arguments clock_nanosleep only ever returns 0 or EINTR,
                 // and EINTR is retried inside.
-                rttb::sleep_until_monotonic(deadline);
-                const timespec wake = rttb::now_monotonic();
+                rttb::sleep_until_raw(deadline);
+                const timespec wake = rttb::now_monotonic_raw();
 
                 // Classify the wake-up and pick the next deadline: on time or late
                 // (< one period) advances the grid by exactly one period; an
-                // overrun (>= one period late) restarts the grid from now, so the
-                // missed cycles are dropped, not run back to back.
+                // overrun (>= one period late) resumes on the next grid point, so
+                // the missed cycles are dropped, not run back to back, and the
+                // phase against the bus is kept.
                 const rttb::Step step = rttb::step(deadline, wake, period_ns);
                 deadline = step.next_deadline;
 
-                // The measured period is the monotonic gap between wake-ups: the
-                // real dt the controllers experienced, immune to wall-clock steps.
+                // The measured period is the raw-clock gap between wake-ups: the
+                // real dt the controllers experienced, immune to wall-clock steps
+                // and NTP slew.
                 // The controller manager receives it clamped to [0, 10 x period]
                 // so a stall never feeds a multi-second dt into an integrator; the
                 // clamp is counted with the overruns.
