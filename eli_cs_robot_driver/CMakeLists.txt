@@ -18,6 +18,8 @@ find_package(rclcpp_lifecycle REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(controller_manager REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
+find_package(control_msgs REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(backward_ros REQUIRED)
 find_package(elite-cs-series-sdk REQUIRED)
 find_package(realtime_tools REQUIRED)
@@ -33,7 +35,9 @@ set(
   std_srvs
   rclcpp 
   rclcpp_components
+  rclcpp_action
   controller_manager_msgs
+  control_msgs
 )
 
 # Add dashboard client component
@@ -242,6 +246,20 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rt_sched test/test_rt_sched.cpp src/rt_sched.cpp)
   target_include_directories(test_rt_sched PRIVATE include)
   ament_target_dependencies(test_rt_sched realtime_tools)
+
+  # The trajectory goal must be canceled before the controllers are deactivated, or the
+  # controller refuses the switch and the goal outlives the stop reporting success.
+  ament_add_gtest(test_controller_stopper test/test_controller_stopper.cpp src/controller_stopper.cpp)
+  target_include_directories(test_controller_stopper PRIVATE include)
+  ament_target_dependencies(
+    test_controller_stopper
+    rclcpp
+    rclcpp_action
+    control_msgs
+    controller_manager_msgs
+    eli_common_interface
+    std_srvs
+  )
 
   # Regression test for elite_control.launch.py's bool-typed launch parameters.
   find_package(ament_cmake_pytest REQUIRED)
