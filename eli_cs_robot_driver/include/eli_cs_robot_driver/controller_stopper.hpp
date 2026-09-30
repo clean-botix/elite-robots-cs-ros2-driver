@@ -4,6 +4,7 @@
 #include "eli_common_interface/srv/get_robot_mode.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -88,6 +89,22 @@ class ControllerStopper {
     // One per cancel still waiting for answers, removed when it finishes; see cancelTrajectoryGoals
     std::vector<rclcpp::TimerBase::SharedPtr> cancel_timeout_timers_;
     std::chrono::nanoseconds cancel_timeout_;
+
+    /*!
+     * \brief Which stop or start is current. Bumped by every findAndStopControllers and every
+     * startControllers.
+     *
+     * The stop is now asynchronous: list controllers, cancel goals, wait for answers, deactivate.
+     * The status topic can flip back to `true` anywhere in that window (an RTSI dropout does it in
+     * well under a second). Without this, the deferred deactivate would land after the restart and
+     * leave the controllers inactive while robot_running_ says otherwise, with no further `true`
+     * coming to fix it. Each deferred step captures the generation it was issued under and does
+     * nothing if a later start or stop has moved it on.
+     */
+    uint64_t stop_generation_ = 0;
+    // True from a stop being requested until its deactivate is sent. A start arriving in between
+    // has nothing to restart, because nothing was deactivated.
+    bool stop_pending_ = false;
 
     /*!
      * \brief Starts the controllers stored in stopped_controllers_.
