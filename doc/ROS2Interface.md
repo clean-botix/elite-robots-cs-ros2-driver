@@ -151,6 +151,12 @@ The robot safety mode.
 #### *robot_task_running*[(std_msgs/msg/Bool)](https://docs.ros.org/en/api/std_msgs/html/msg/Bool.html)
 If running task and robot connected, the value is true. Else is false.
 
+> **Side effect: in-flight trajectory goals are cancelled when this goes `false`.** The [controller_stopper](../eli_cs_robot_driver/README.md#controller_stopper) reacts to `false` by cancelling every goal on `<controller>/follow_joint_trajectory` for each controller it is about to deactivate, and only then deactivating them. Those goals were sent by other nodes (e.g. MoveIt Pro); their senders see the goal end as *canceled*, not *succeeded*.
+>
+> This is a deliberate, temporary workaround and is well outside normal ROS 2 action usage, where only the node that sent a goal cancels it. PickNik's `joint_trajectory_admittance_controller` refuses to deactivate while it holds a goal, so without the cancel a protective stop leaves the goal alive and it later reports success for a motion the robot abandoned. Removing the workaround once that controller is fixed is tracked in [Linear SW-1330](https://linear.app/clean-botix/issue/SW-1330/).
+>
+> Because this topic is the logical AND of "task running" and "RTSI connection up", a brief RTSI dropout also drives it `false` and cancels a running trajectory goal, even though the hardware interface reconnects on its own. A pause keeps it `true` and cancels nothing.
+
 ### Services
 
 #### *set_io*[(eli_common_interface/srv/SetIO)](/eli_common_interface/srv/SetIO.srv)
