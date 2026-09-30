@@ -147,6 +147,9 @@ class FakeRobot {
                     }
                     log_.record("deactivate");
                 }
+                if (!request->activate_controllers.empty()) {
+                    log_.record("activate");
+                }
                 response->ok = true;
             });
 
@@ -248,8 +251,9 @@ class FakeRobot {
 
 class ControllerStopperTest : public ::testing::Test {
    protected:
-    // Not SetUp: each test picks the robot it runs against
-    void start(FakeRobotConfig config = FakeRobotConfig()) {
+    // Not SetUp: each test picks the robot it runs against, and how the timeout is spelled
+    void start(FakeRobotConfig config = FakeRobotConfig(),
+               rclcpp::ParameterValue cancel_timeout = rclcpp::ParameterValue(CANCEL_TIMEOUT_S)) {
         robot_ = std::make_unique<FakeRobot>(log_, std::move(config));
         client_node_ = std::make_shared<rclcpp::Node>("trajectory_goal_sender");
         robot_executor_.add_node(robot_->node());
@@ -261,7 +265,7 @@ class ControllerStopperTest : public ::testing::Test {
         rclcpp::NodeOptions options;
         options.parameter_overrides(
             {rclcpp::Parameter("consistent_controllers", std::vector<std::string>{CONSISTENT_CONTROLLER}),
-             rclcpp::Parameter("trajectory_cancel_timeout", CANCEL_TIMEOUT_S)});
+             rclcpp::Parameter("trajectory_cancel_timeout", cancel_timeout)});
         stopper_node_ = std::make_shared<rclcpp::Node>("controller_stopper_under_test", options);
 
         // The constructor waits on every service and spins its own node while it does
@@ -353,16 +357,81 @@ TEST_F(ControllerStopperTest, CancelsBeforeDeactivating) {
     EXPECT_FALSE(deactivated(CONSISTENT_CONTROLLER));
 }
 
-TEST_F(ControllerStopperTest, LeavesTheGoalAloneWhileTheRobotTaskRuns) {
+// The topic is published every cycle, so `true` arrives constantly while the robot is already
+// running. Only the transition matters. (This is not the pause case: pausing the robot task drives
+// the topic `false`, since the hardware interface publishes true only while the task is PLAYING.)
+TEST_F(ControllerStopperTest, IgnoresARepeatedTrueWhileTheRobotTaskRuns) {
     start();
     sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
 
     robot_->publishTaskRunning(true);
     spinFor(1s);
 
-    EXPECT_FALSE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER)))
-        << "a running task is not a reason to cancel: this is the pause case";
+    EXPECT_FALSE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER))) << "a repeated true is not a reason to cancel";
     EXPECT_FALSE(log_.contains("deactivate"));
+    EXPECT_FALSE(log_.contains("activate"));
+}
+
+// The stop is asynchronous now, so the topic can flip back to `true` while the cancels are still
+// being waited on: a brief RTSI dropout does exactly this. Before the cancel was added, the
+// deactivate went out synchronously and nothing could interleave. If the deferred deactivate lands
+// after the restart, the controllers end up inactive with the stopper believing the robot is
+// running, and no further `true` ever comes to bring them back.
+TEST_F(ControllerStopperTest, DoesNotDeactivateWhenTheRobotTaskComesBackDuringTheCancel) {
+    FakeRobotConfig config;
+    config.cancel_mode = CancelMode::NEVER_ANSWER;
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    robot_->publishTaskRunning(false);
+    // The cancel reaching the server proves the stop is in its waiting window
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains(cancelEvent(TRAJECTORY_CONTROLLER)); }, 10s))
+        << "the cancel was never sent, so the window under test was never open";
+    ASSERT_FALSE(log_.contains("deactivate")) << "the deactivate did not wait for the cancel; nothing to race";
+
+    robot_->publishTaskRunning(true);
+    // Past the cancel timeout, so a deactivate that was going to land has landed
+    spinFor(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(CANCEL_TIMEOUT_S * 3)));
+
+    EXPECT_FALSE(log_.contains("deactivate"))
+        << "the deferred deactivate landed after the restart, leaving the controllers dead";
+    EXPECT_FALSE(log_.contains("activate")) << "nothing was deactivated, so there was nothing to activate";
+
+    // And a later stop still works: the stopper is not wedged by the superseded one
+    robot_->releaseCancels();
+    robot_->publishTaskRunning(false);
+    EXPECT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s))
+        << "the stop after a superseded stop never deactivated";
+}
+
+// An integer is the natural way to write the timeout in YAML or a launch dictionary. A statically
+// typed double declaration throws on it and takes the node down at startup, before it has stopped
+// anything.
+TEST_F(ControllerStopperTest, AcceptsAnIntegerCancelTimeout) {
+    ASSERT_NO_THROW(start(FakeRobotConfig(), rclcpp::ParameterValue(static_cast<int64_t>(1))));
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    robot_->publishTaskRunning(false);
+
+    EXPECT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s))
+        << "the stopper did not work with an integer timeout";
+}
+
+// Zero means "send the cancels and deactivate without waiting for the answers", not "use the default".
+TEST_F(ControllerStopperTest, DoesNotWaitForTheCancelWhenTheTimeoutIsZero) {
+    FakeRobotConfig config;
+    config.cancel_mode = CancelMode::NEVER_ANSWER;
+    start(config, rclcpp::ParameterValue(0.0));
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    const auto stopped_at = std::chrono::steady_clock::now();
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s)) << "controllers were never deactivated";
+    const auto waited = std::chrono::steady_clock::now() - stopped_at;
+    EXPECT_LT(waited, std::chrono::duration<double>(CANCEL_TIMEOUT_S))
+        << "a zero timeout still waited for an answer that never came";
+    EXPECT_TRUE(deactivated(TRAJECTORY_CONTROLLER));
 }
 
 // Boot order on the robot: this node comes up with the driver, before the spawners have loaded

@@ -46,4 +46,4 @@
 
 &emsp;&emsp;**停止控制器之前会先取消轨迹目标。** 状态变为`false`时，节点先取消每个待停止控制器 `<controller>/follow_joint_trajectory` 上的全部目标，再通过一次切换停止这些控制器。这是针对 PickNik `joint_trajectory_admittance_controller` 在持有目标时拒绝停止的临时方案，它会取消并非本节点发送的目标，不符合 ROS 2 常规用法，该控制器修复后将移除（[Linear SW-1330](https://linear.app/clean-botix/issue/SW-1330/)）。
 
-&emsp;&emsp;取消是尽力而为的：没有轨迹 action 的控制器直接停止；取消被拒绝不会阻止停止；若轨迹服务器在 `trajectory_cancel_timeout` 秒（参数，默认 `1.0`）内没有应答，节点会记录未应答的控制器并照常停止它们。
+&emsp;&emsp;取消是尽力而为的：没有轨迹 action 的控制器直接停止；取消被拒绝不会阻止停止；若轨迹服务器在 `trajectory_cancel_timeout` 秒（参数，默认 `1.0`，整数或浮点数均可，`0` 表示发出取消后立即停止）内没有应答，节点会记录未应答的控制器并照常停止它们。若在控制器被停止之前状态已恢复为 `true`，则本次停止被放弃，控制器保持运行。
