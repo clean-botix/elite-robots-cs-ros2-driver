@@ -3,6 +3,7 @@
 
 #include "eli_common_interface/srv/get_robot_mode.hpp"
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -21,7 +22,16 @@ class ControllerStopper {
    public:
     ControllerStopper() = delete;
     ControllerStopper(const rclcpp::Node::SharedPtr& node, bool stop_controllers_on_startup);
-    virtual ~ControllerStopper() = default;
+    /*!
+     * \brief Stops every timer and drops every pending request that captured `this`.
+     *
+     * The prime timer repeats for the life of the object, a cancel timeout may still be armed, and
+     * service and action callbacks may be pending; all of them call back into this object. rclcpp
+     * already frees them with their members, but only once the last reference goes -- and an
+     * executor mid-dispatch holds one. Cancelling them explicitly makes "nothing fires after
+     * destruction" not depend on that, since the node can outlive the stopper.
+     */
+    virtual ~ControllerStopper();
 
    private:
     void robotRunningCallback(const std_msgs::msg::Bool::ConstSharedPtr msg);
@@ -47,6 +57,15 @@ class ControllerStopper {
      *
      * Goals are cancelled on `<controller>/follow_joint_trajectory`. A controller with no such
      * action has no server to answer and is skipped.
+     *
+     * Best effort: `on_cancelled` runs once, when every cancel has answered (accepted or refused)
+     * or when `trajectory_cancel_timeout` seconds have passed, whichever comes first. A server that
+     * never answers must not keep the rest of the stopped controllers running, so on timeout the
+     * unanswered controllers are logged and the deactivate goes ahead anyway.
+     *
+     * This cancels goals this node did not send, which is well outside normal ROS 2 action usage.
+     * It works around PickNik's joint_trajectory_admittance_controller refusing to deactivate
+     * while it holds a goal, and is to be removed once that is fixed (Linear SW-1330).
      */
     void cancelTrajectoryGoals(const std::vector<std::string>& controllers, std::function<void()> on_cancelled);
 
@@ -65,6 +84,10 @@ class ControllerStopper {
     void primeTrajectoryActionClients();
 
     rclcpp::TimerBase::SharedPtr prime_timer_;
+
+    // One per cancel still waiting for answers, removed when it finishes; see cancelTrajectoryGoals
+    std::vector<rclcpp::TimerBase::SharedPtr> cancel_timeout_timers_;
+    std::chrono::nanoseconds cancel_timeout_;
 
     /*!
      * \brief Starts the controllers stored in stopped_controllers_.

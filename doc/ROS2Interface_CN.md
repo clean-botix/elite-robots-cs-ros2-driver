@@ -146,6 +146,12 @@ p {
 #### *robot_task_running*[(std_msgs/msg/Bool)](https://docs.ros.org/en/api/std_msgs/html/msg/Bool.html)
 如果任务正在运行且机器人已连接，值为 true，否则为 false。
 
+> **副作用：该值变为 `false` 时会取消正在执行的轨迹目标。** [controller_stopper](../eli_cs_robot_driver/README_CN.md#controller_stopper) 在停止控制器之前，会先取消每个待停止控制器 `<controller>/follow_joint_trajectory` 上的全部目标。这些目标由其他节点（例如 MoveIt Pro）发送，发送方会看到目标以 *canceled* 结束，而不是 *succeeded*。
+>
+> 这是一个有意为之的临时方案，不符合 ROS 2 action 的常规用法（通常只有发送目标的节点才会取消它）。它用于绕过 PickNik `joint_trajectory_admittance_controller` 在持有目标时拒绝停止的问题。该控制器修复后移除此方案，见 [Linear SW-1330](https://linear.app/clean-botix/issue/SW-1330/)。
+>
+> 该话题是“任务运行”与“RTSI 连接正常”的逻辑与，因此 RTSI 短暂断开也会使其变为 `false` 并取消正在执行的轨迹目标，即使硬件接口会自动重连。暂停时该值保持 `true`，不会取消任何目标。
+
 ### 服务
 
 #### *set_io*[(eli_common_interface/srv/SetIO)](/eli_common_interface/srv/SetIO.srv)
