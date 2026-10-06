@@ -23,7 +23,7 @@
 // pin from the rt_sched.* parameters. ROS-free like rt_memory (see rt_sched.hpp);
 // this file logs its result. See test/test_rt_sched.cpp.
 #include "eli_cs_robot_driver/rt_sched.hpp"
-// Real-time TIMEBASE of the control loop: the CLOCK_MONOTONIC deadline grid,
+// Real-time TIMEBASE of the control loop: the CLOCK_MONOTONIC_RAW deadline grid,
 // overrun classification/resync, and the lock-free PeriodStats the loop fills
 // for a reporter on the executor thread. ROS-free (see rt_timebase.hpp).
 // See test/test_rt_timebase.cpp.

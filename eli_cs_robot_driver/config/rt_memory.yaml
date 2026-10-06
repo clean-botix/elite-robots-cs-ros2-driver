@@ -26,11 +26,12 @@ controller_manager:
     # container's cpuset is reported as a failed pin and the loop stays unpinned.
     # rt_sched.cpu: -1
 
-    # Control loop TIMEBASE report (rt_timebase.hpp). The loop schedules on
-    # CLOCK_MONOTONIC with absolute deadlines and records each cycle's measured
-    # period, lateness and any overrun (a wake-up a full period or more late,
-    # after which the grid restarts from "now" instead of bursting to catch up)
-    # into lock-free counters. A wall timer on the executor thread logs one
+    # Control loop TIMEBASE report (rt_timebase.hpp). The loop schedules on a
+    # CLOCK_MONOTONIC_RAW period grid with absolute deadlines (each sleep is
+    # translated to CLOCK_MONOTONIC, because the kernel cannot sleep on RAW). It
+    # records each cycle's measured period, lateness and any overrun (a wake-up
+    # a full period or more late, after which the loop resumes on the next grid
+    # point instead of bursting to catch up) into lock-free counters. A wall timer on the executor thread logs one
     # "Control loop timing:" line per interval with n and the monotonic span of
     # those cycles ("n=1500 over 30.00 s"), min/mean/max/std of the period,
     # overruns, clamps (dt handed to the controllers capped at 10 periods) and
