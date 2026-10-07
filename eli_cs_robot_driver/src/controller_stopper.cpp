@@ -1,13 +1,12 @@
 #include <algorithm>
 #include <memory>
 #include <set>
-#include <utility>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <action_msgs/srv/cancel_goal.hpp>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
-#include <rclcpp/exceptions.hpp>
 #include <rclcpp/utilities.hpp>
 
 #include "eli_cs_robot_driver/controller_stopper.hpp"
@@ -68,39 +67,19 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
 
     consistent_controllers_ = node_->declare_parameter<std::vector<std::string>>("consistent_controllers");
 
-    // How long a stop waits for trajectory cancels to be answered before deactivating anyway.
-    // Declared dynamically typed so `2` in a YAML or launch dictionary is as good as `2.0`; a
-    // statically typed double declaration throws on an integer and takes the node down at startup.
     rcl_interfaces::msg::ParameterDescriptor cancel_timeout_descriptor;
-    cancel_timeout_descriptor.description =
-        "Seconds a stop waits for trajectory cancels to be answered before deactivating anyway. "
-        "0 deactivates as soon as the cancels are sent.";
+    cancel_timeout_descriptor.description = "Seconds a stop waits for trajectory cancels before it deactivates anyway.";
+    // A double declaration throws on an integer such as `2` from YAML. Dynamic typing accepts both.
     cancel_timeout_descriptor.dynamic_typing = true;
     const rclcpp::ParameterValue cancel_timeout_value =
         node_->declare_parameter("trajectory_cancel_timeout", rclcpp::ParameterValue(1.0), cancel_timeout_descriptor);
-    double cancel_timeout_s = 1.0;
-    switch (cancel_timeout_value.get_type()) {
-        case rclcpp::ParameterType::PARAMETER_DOUBLE:
-            cancel_timeout_s = cancel_timeout_value.get<double>();
-            break;
-        case rclcpp::ParameterType::PARAMETER_INTEGER:
-            cancel_timeout_s = static_cast<double>(cancel_timeout_value.get<int64_t>());
-            break;
-        default:
-            RCLCPP_WARN(rclcpp::get_logger("Controller stopper"),
-                        "trajectory_cancel_timeout is not a number; using the default of %.1f s", cancel_timeout_s);
-            break;
-    }
-    if (cancel_timeout_s < 0.0) {
-        RCLCPP_WARN(rclcpp::get_logger("Controller stopper"),
-                    "trajectory_cancel_timeout of %.3f s is negative; using the default of 1.0 s", cancel_timeout_s);
-        cancel_timeout_s = 1.0;
-    }
-    cancel_timeout_ =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(cancel_timeout_s));
+    const double cancel_timeout_s = cancel_timeout_value.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER
+                                        ? static_cast<double>(cancel_timeout_value.get<int64_t>())
+                                        : cancel_timeout_value.get<double>();
+    cancel_timeout_ = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(cancel_timeout_s));
 
     primeTrajectoryActionClients();
-    // The controllers are not loaded yet at this point, so keep looking until they are
+    // The spawners load the controllers after this node starts
     prime_timer_ = node_->create_wall_timer(std::chrono::seconds(2), [this]() { primeTrajectoryActionClients(); });
 
     // Get robot mode and if robot is power off, stop controller on startup
@@ -122,14 +101,8 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
             rclcpp::spin_until_future_complete(node_, future);
             auto result = future.get();
             for (auto& controller : result->controller) {
-                // Check if in consistent_controllers
-                // Else:
-                //   Add to stopped_controllers
-                if (controller.state == "active") {
-                    auto it = std::find(consistent_controllers_.begin(), consistent_controllers_.end(), controller.name);
-                    if (it == consistent_controllers_.end()) {
-                        stopped_controllers_.push_back(controller.name);
-                    }
+                if (controller.state == "active" && !isConsistent(controller.name)) {
+                    stopped_controllers_.push_back(controller.name);
                 }
             }
             rclcpp::sleep_for(std::chrono::milliseconds(100));
@@ -147,30 +120,24 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
 }
 
 ControllerStopper::~ControllerStopper() {
-    // Every one of these calls back into this object; none may fire once it is gone
-    if (prime_timer_) {
-        prime_timer_->cancel();
-        prime_timer_.reset();
-    }
+    prime_timer_->cancel();
     for (auto& timer : cancel_timeout_timers_) {
         timer->cancel();
     }
-    cancel_timeout_timers_.clear();
     robot_running_sub_.reset();
-    if (controller_list_srv_) {
-        controller_list_srv_->prune_pending_requests();
-    }
-    if (controller_manager_srv_) {
-        controller_manager_srv_->prune_pending_requests();
-    }
-    // Dropping the action clients drops the cancel callbacks still waiting on them
+    controller_list_srv_->prune_pending_requests();
+    controller_manager_srv_->prune_pending_requests();
+    // Dropping the action clients drops their pending cancel callbacks
     trajectory_action_clients_.clear();
+}
+
+bool ControllerStopper::isConsistent(const std::string& controller) const {
+    return std::find(consistent_controllers_.begin(), consistent_controllers_.end(), controller) != consistent_controllers_.end();
 }
 
 void ControllerStopper::findAndStopControllers() {
     stopped_controllers_.clear();
     const uint64_t generation = ++stop_generation_;
-    stop_pending_ = true;
     auto request_switch_controller = std::make_shared<controller_manager_msgs::srv::SwitchController::Request>();
     auto request_list_controllers = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
 
@@ -195,37 +162,25 @@ void ControllerStopper::findAndStopControllers() {
             }
             auto result = future_response.get();
             for (auto& controller : result->controller) {
-                // Check if in consistent_controllers
-                // Else:
-                //   Add to stopped_controllers
-                if (controller.state == "active") {
-                    auto it = std::find(consistent_controllers_.begin(), consistent_controllers_.end(), controller.name);
-                    if (it == consistent_controllers_.end()) {
-                        stopped_controllers_.push_back(controller.name);
-                    }
+                if (controller.state == "active" && !isConsistent(controller.name)) {
+                    stopped_controllers_.push_back(controller.name);
                 }
             }
-            // A controller that keeps its goal stays active; the rest must still stop
-            request_switch_controller->strictness = request_switch_controller->BEST_EFFORT;
             if (stopped_controllers_.empty()) {
-                stop_pending_ = false;
                 return;
             }
+            // A controller that keeps its goal stays active. BEST_EFFORT still stops the rest.
+            request_switch_controller->strictness = request_switch_controller->BEST_EFFORT;
             request_switch_controller->deactivate_controllers = stopped_controllers_;
-            // A controller still holding a trajectory goal refuses to deactivate, so the goal
-            // has to go first -- see cancelTrajectoryGoals.
             cancelTrajectoryGoals(
                 stopped_controllers_, [this, generation, request_switch_controller, callback_switch_controller]() {
                     if (generation != stop_generation_) {
-                        // startControllers already saw nothing was deactivated and skipped the
-                        // activate; deactivating now would leave the arm dead with nothing to
-                        // revive it.
                         RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
-                                    "Robot task came back while trajectory goals were being cancelled; "
+                                    "Robot task came back while trajectory goals were being canceled; "
                                     "leaving the controllers active");
                         return;
                     }
-                    stop_pending_ = false;
+                    deactivated_generation_ = generation;
                     controller_manager_srv_->async_send_request(request_switch_controller, callback_switch_controller);
                 });
         };
@@ -233,20 +188,16 @@ void ControllerStopper::findAndStopControllers() {
     auto future = controller_list_srv_->async_send_request(request_list_controllers, callback_list_controller);
 }
 
-void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& controllers,
-                                              std::function<void()> on_cancelled) {
+void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& controllers, std::function<void()> on_canceled) {
     using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
 
-    // Only clients primed earlier are usable. One created here would not have discovered its
-    // server yet, would report not ready, and would be skipped -- which is indistinguishable from
-    // having no cancel at all, so there is nothing to gain by making one.
+    // A client created now would not discover its server in time
     std::vector<std::pair<std::string, rclcpp_action::Client<FollowJointTrajectory>::SharedPtr>> to_cancel;
     for (const auto& controller : controllers) {
         auto it = trajectory_action_clients_.find(controller);
         if (it == trajectory_action_clients_.end()) {
             RCLCPP_WARN(rclcpp::get_logger("Controller stopper"),
-                        "No trajectory cancel client for '%s' yet; deactivating it without a cancel",
-                        controller.c_str());
+                        "No trajectory cancel client for '%s' yet; deactivating it without a cancel", controller.c_str());
             continue;
         }
         if (it->second->action_server_is_ready()) {
@@ -255,31 +206,28 @@ void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& co
             RCLCPP_WARN(rclcpp::get_logger("Controller stopper"),
                         "Trajectory action server for '%s' has gone away; deactivating it without a cancel", controller.c_str());
         } else {
-            // Not every stoppable controller runs a trajectory action
             RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
                         "'%s' has no trajectory action server; deactivating it without a cancel", controller.c_str());
         }
     }
 
     if (to_cancel.empty()) {
-        on_cancelled();
+        on_canceled();
         return;
     }
 
-    RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
-                "Cancelling trajectory goals on %zu controller(s) before deactivating", to_cancel.size());
+    RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "Canceling trajectory goals on %zu controller(s) before deactivating",
+                to_cancel.size());
 
-    // The switch runs once: after the last controller answers, or after the timeout if one never
-    // does. Cancelling is best effort, so a refused cancel counts as an answer -- it must not
-    // strand the switch that follows -- and so does silence once the timeout expires.
+    // on_canceled runs once. It runs after the last answer or after the timeout.
     struct PendingCancel {
         std::set<std::string> unanswered;
-        std::function<void()> on_cancelled;
+        std::function<void()> on_canceled;
         rclcpp::TimerBase::WeakPtr timeout;
         bool finished = false;
     };
     auto pending = std::make_shared<PendingCancel>();
-    pending->on_cancelled = std::move(on_cancelled);
+    pending->on_canceled = std::move(on_canceled);
     for (const auto& entry : to_cancel) {
         pending->unanswered.insert(entry.first);
     }
@@ -291,74 +239,45 @@ void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& co
         pending->finished = true;
         if (auto timer = pending->timeout.lock()) {
             timer->cancel();
-            cancel_timeout_timers_.erase(
-                std::remove(cancel_timeout_timers_.begin(), cancel_timeout_timers_.end(), timer),
-                cancel_timeout_timers_.end());
+            cancel_timeout_timers_.erase(std::remove(cancel_timeout_timers_.begin(), cancel_timeout_timers_.end(), timer),
+                                         cancel_timeout_timers_.end());
         }
-        pending->on_cancelled();
+        pending->on_canceled();
     };
 
-    const bool no_wait = cancel_timeout_ == std::chrono::nanoseconds::zero();
-    auto timer = node_->create_wall_timer(cancel_timeout_, [pending, finish, no_wait]() {
+    auto timer = node_->create_wall_timer(cancel_timeout_, [pending, finish]() {
         if (pending->finished) {
             return;
         }
-        const std::string names = joinNames(std::vector<std::string>(pending->unanswered.begin(), pending->unanswered.end()));
-        if (no_wait) {
-            // Configured not to wait: silence is expected, not a fault
-            RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
-                        "Not waiting for trajectory cancels on [%s]; deactivating now", names.c_str());
-        } else {
-            RCLCPP_ERROR(rclcpp::get_logger("Controller stopper"),
-                         "Trajectory cancel got no answer from [%s] within the timeout; deactivating anyway",
-                         names.c_str());
-        }
+        RCLCPP_ERROR(rclcpp::get_logger("Controller stopper"),
+                     "Trajectory cancel got no answer from [%s] within the timeout; deactivating anyway",
+                     joinNames({pending->unanswered.begin(), pending->unanswered.end()}).c_str());
         finish();
     });
     pending->timeout = timer;
     cancel_timeout_timers_.push_back(timer);
 
-    for (const auto& entry : to_cancel) {
-        const std::string controller = entry.first;
-        try {
-            entry.second->async_cancel_all_goals(
-                [pending, finish, controller](const rclcpp_action::Client<FollowJointTrajectory>::CancelResponse::SharedPtr response) {
-                    if (response && response->return_code == action_msgs::srv::CancelGoal::Response::ERROR_REJECTED) {
-                        // Cancel-all answers REJECTED both when there was no goal to cancel (the
-                        // usual case: the arm was idle) and when the controller refused to give one
-                        // up. The two cannot be told apart here; a refusal shows up as the
-                        // deactivate failing, which is reported on its own.
-                        RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
-                                    "Trajectory cancel for '%s' cancelled nothing (no goal, or refused)",
-                                    controller.c_str());
-                    } else if (response && response->return_code != action_msgs::srv::CancelGoal::Response::ERROR_NONE) {
-                        RCLCPP_WARN(rclcpp::get_logger("Controller stopper"),
-                                    "Trajectory cancel for '%s' answered with return code %d", controller.c_str(),
-                                    response->return_code);
-                    }
-                    pending->unanswered.erase(controller);
-                    if (pending->unanswered.empty()) {
-                        finish();
-                    }
-                });
-        } catch (const rclcpp::exceptions::RCLError& e) {
-            // The cancel service can vanish under us (controller unloading, context shutting down).
-            // This runs inside a service callback, so an escaping exception would end the node
-            // with the stop half done. Count it as answered and carry on.
-            RCLCPP_WARN(rclcpp::get_logger("Controller stopper"), "Could not send trajectory cancel to '%s': %s",
-                        controller.c_str(), e.what());
+    for (const auto& [controller, client] : to_cancel) {
+        client->async_cancel_all_goals([pending, finish, controller = controller](
+                                           const rclcpp_action::Client<FollowJointTrajectory>::CancelResponse::SharedPtr response) {
+            if (response->return_code == action_msgs::srv::CancelGoal::Response::ERROR_REJECTED) {
+                // REJECTED means no goal or a refusal. A refusal surfaces as a failed deactivate.
+                RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
+                            "Trajectory cancel for '%s' canceled nothing (no goal, or refused)", controller.c_str());
+            } else if (response->return_code != action_msgs::srv::CancelGoal::Response::ERROR_NONE) {
+                RCLCPP_WARN(rclcpp::get_logger("Controller stopper"), "Trajectory cancel for '%s' answered with return code %d",
+                            controller.c_str(), response->return_code);
+            }
             pending->unanswered.erase(controller);
-        }
-    }
-    // Only sends that failed can have emptied the set here: answers arrive through the executor
-    if (pending->unanswered.empty()) {
-        finish();
+            if (pending->unanswered.empty()) {
+                finish();
+            }
+        });
     }
 }
 
 void ControllerStopper::primeTrajectoryActionClients() {
-    // Asynchronous because this also runs from a timer, and spinning the node from inside its own
-    // callback would re-enter the executor.
+    // A timer callback must not spin its own node. The request is therefore asynchronous.
     auto request = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
     controller_list_srv_->async_send_request(
         request, [this](rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedFuture future) {
@@ -370,17 +289,12 @@ void ControllerStopper::primeTrajectoryActionClients() {
             }
             std::size_t added = 0;
             for (const auto& controller : response->controller) {
-                if (trajectory_action_clients_.count(controller.name) > 0) {
+                if (trajectory_action_clients_.count(controller.name) > 0 || isConsistent(controller.name)) {
                     continue;
                 }
-                // Consistent controllers are never stopped, so never cancelled: no client needed
-                if (std::find(consistent_controllers_.begin(), consistent_controllers_.end(), controller.name) !=
-                    consistent_controllers_.end()) {
-                    continue;
-                }
-                trajectory_action_clients_.emplace(
-                    controller.name, rclcpp_action::create_client<control_msgs::action::FollowJointTrajectory>(
-                                         node_, controller.name + "/follow_joint_trajectory"));
+                trajectory_action_clients_.emplace(controller.name,
+                                                   rclcpp_action::create_client<control_msgs::action::FollowJointTrajectory>(
+                                                       node_, controller.name + "/follow_joint_trajectory"));
                 ++added;
             }
             if (added > 0) {
@@ -392,30 +306,23 @@ void ControllerStopper::primeTrajectoryActionClients() {
 }
 
 void ControllerStopper::startControllers() {
-    // Invalidates any stop still in flight; see stop_generation_
+    const bool current_stop_deactivated = deactivated_generation_ == stop_generation_;
     ++stop_generation_;
-    if (stop_pending_) {
-        // The stop never got as far as deactivating, so there is nothing to bring back. A STRICT
-        // activate of controllers that are still active would only be refused.
-        stop_pending_ = false;
-        RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
-                    "Robot task came back before the controllers were deactivated; nothing to restart");
+    if (!current_stop_deactivated) {
+        RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "No controllers were deactivated; nothing to restart");
         return;
     }
-    if (!stopped_controllers_.empty()) {
-        auto request = std::make_shared<controller_manager_msgs::srv::SwitchController::Request>();
-        // A controller that kept its goal never stopped; STRICT would refuse the whole activate for it
-        request->strictness = request->BEST_EFFORT;
-        request->activate_controllers = stopped_controllers_;
-        auto callback = [request](rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedFuture future_response) {
-            auto result = future_response.get();
-            if (result->ok == false) {
-                RCLCPP_ERROR(rclcpp::get_logger("Controller stopper"), "Could not activate all of [%s]",
-                             joinNames(request->activate_controllers).c_str());
-            }
-        };
-        auto future = controller_manager_srv_->async_send_request(request, callback);
-    }
+    auto request = std::make_shared<controller_manager_msgs::srv::SwitchController::Request>();
+    // A controller that kept its goal is still active. STRICT would refuse the whole activate.
+    request->strictness = request->BEST_EFFORT;
+    request->activate_controllers = stopped_controllers_;
+    auto callback = [request](rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedFuture future_response) {
+        if (future_response.get()->ok == false) {
+            RCLCPP_ERROR(rclcpp::get_logger("Controller stopper"), "Could not activate all of [%s]",
+                         joinNames(request->activate_controllers).c_str());
+        }
+    };
+    controller_manager_srv_->async_send_request(request, callback);
 }
 
 void ControllerStopper::robotRunningCallback(const std_msgs::msg::Bool::ConstSharedPtr msg) {

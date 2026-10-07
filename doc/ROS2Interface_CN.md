@@ -146,11 +146,11 @@ p {
 #### *robot_task_running*[(std_msgs/msg/Bool)](https://docs.ros.org/en/api/std_msgs/html/msg/Bool.html)
 如果任务正在运行且机器人已连接，值为 true，否则为 false。
 
-> **副作用：该值变为 `false` 时会取消正在执行的轨迹目标。** [controller_stopper](../eli_cs_robot_driver/README_CN.md#controller_stopper) 在停止控制器之前，会先取消每个待停止控制器 `<controller>/follow_joint_trajectory` 上的全部目标。这些目标由其他节点（例如 MoveIt Pro）发送，发送方会看到目标以 *canceled* 结束，而不是 *succeeded*。
+> **副作用：该值变为 `false` 时会取消正在执行的轨迹目标。** [controller_stopper](../eli_cs_robot_driver/README_CN.md#controller_stopper) 在停止控制器之前，先取消该控制器 `<controller>/follow_joint_trajectory` 上的全部目标。这些目标由其他节点发送，例如 MoveIt Pro。发送方会看到目标以 *canceled* 结束，而不是 *succeeded*。
 >
-> 这是一个有意为之的临时方案，不符合 ROS 2 action 的常规用法（通常只有发送目标的节点才会取消它）。它用于绕过 PickNik `joint_trajectory_admittance_controller` 在持有目标时拒绝停止的问题。该控制器修复后移除此方案，见 [Linear SW-1330](https://linear.app/clean-botix/issue/SW-1330/)。
+> 这是一个临时方案，不符合 ROS 2 action 的常规用法。通常只有发送目标的节点才会取消它。PickNik `joint_trajectory_admittance_controller` 在持有目标时拒绝停止。没有取消时，保护性停止会让目标继续存在。该目标随后会为机器人已放弃的运动报告成功。[Linear SW-1330](https://linear.app/clean-botix/issue/SW-1330/) 跟踪此方案的移除。
 >
-> 该话题是“任务运行”与“外部控制脚本已连接”（其 reverse、trajectory 和 script command 套接字）的逻辑与，因此其中任一连接短暂断开也会使其变为 `false` 并取消正在执行的轨迹目标。暂停机器人任务同样会使其变为 `false`：硬件接口仅在任务状态为 *PLAYING* 时发布 `true`，因此暂停也会取消目标，恢复运行后目标不会回来。若在控制器被停止之前该值已恢复为 `true`，则本次停止被放弃，控制器保持激活，但已取消的目标不会恢复。
+> 仅当任务状态为 *PLAYING* 且外部控制脚本已连接时，该话题才为 `true`。该连接包括脚本的 reverse、trajectory 和 script command 套接字。任一套接字短暂断开都会使该话题变为 `false` 并取消正在执行的目标。暂停同样会取消目标，恢复运行后目标不会回来。若该值在停止控制器之前恢复为 `true`，控制器保持激活。已取消的目标不会恢复。
 
 ### 服务
 

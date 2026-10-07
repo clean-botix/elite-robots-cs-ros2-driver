@@ -255,8 +255,7 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rt_timebase test/test_rt_timebase.cpp src/rt_timebase.cpp)
   target_include_directories(test_rt_timebase PRIVATE include)
 
-  # The trajectory goal must be canceled before the controllers are deactivated, or the
-  # controller refuses the switch and the goal outlives the stop reporting success.
+  # ControllerStopper cancels trajectory goals before it deactivates controllers.
   ament_add_gtest(test_controller_stopper test/test_controller_stopper.cpp src/controller_stopper.cpp)
   target_include_directories(test_controller_stopper PRIVATE include)
   ament_target_dependencies(
