@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -110,6 +111,11 @@ struct FakeRobotConfig {
 
 // The controller manager, the dashboard and the arm, as far as the stopper can tell.
 //
+// The switch follows controller_manager 2.53.1. STRICT refuses the whole request when a listed
+// controller is already in the requested state; BEST_EFFORT skips that controller. The switch
+// itself goes controller by controller, and a controller still holding a goal refuses to deactivate
+// while the rest of the request goes through.
+//
 // The trajectory action servers live on their own node so they can be spun by their own executor:
 // a wedged server must not also wedge the controller manager, or the timeout could not be seen.
 class FakeRobot {
@@ -120,18 +126,23 @@ class FakeRobot {
           log_(log),
           config_(std::move(config)),
           controllers_loaded_(config_.controllers_loaded) {
+        for (const auto& controller : config_.controllers) {
+            active_.insert(controller.name);
+        }
         list_srv_ = node_->create_service<controller_manager_msgs::srv::ListControllers>(
             "controller_manager/list_controllers",
             [this](const controller_manager_msgs::srv::ListControllers::Request::SharedPtr,
                    controller_manager_msgs::srv::ListControllers::Response::SharedPtr response) {
                 list_requests_.fetch_add(1);
+                std::unique_lock<std::mutex> lock(mutex_);
+                listings_cv_.wait(lock, [this]() { return !listings_held_; });
                 if (!controllers_loaded_.load()) {
                     return;
                 }
                 for (const auto& controller : config_.controllers) {
                     controller_manager_msgs::msg::ControllerState state;
                     state.name = controller.name;
-                    state.state = "active";
+                    state.state = active_.count(controller.name) > 0 ? "active" : "inactive";
                     response->controller.push_back(state);
                 }
             });
@@ -141,16 +152,13 @@ class FakeRobot {
             [this](const controller_manager_msgs::srv::SwitchController::Request::SharedPtr request,
                    controller_manager_msgs::srv::SwitchController::Response::SharedPtr response) {
                 if (!request->deactivate_controllers.empty()) {
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        deactivated_ = request->deactivate_controllers;
-                    }
                     log_.record("deactivate");
                 }
                 if (!request->activate_controllers.empty()) {
                     log_.record("activate");
                 }
-                response->ok = true;
+                std::lock_guard<std::mutex> lock(mutex_);
+                response->ok = switchControllers(*request);
             });
 
         mode_srv_ = node_->create_service<eli_common_interface::srv::GetRobotMode>(
@@ -197,9 +205,9 @@ class FakeRobot {
         return goal_handles_.count(controller) > 0;
     }
 
-    std::vector<std::string> deactivated() {
+    bool isActive(const std::string& controller) {
         std::lock_guard<std::mutex> lock(mutex_);
-        return deactivated_;
+        return active_.count(controller) > 0;
     }
 
     int listRequests() const { return list_requests_.load(); }
@@ -213,12 +221,65 @@ class FakeRobot {
         released_cv_.notify_all();
     }
 
+    // Holds every list_controllers answer until released, which also stalls the other services
+    void holdListings() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        listings_held_ = true;
+    }
+
+    void releaseListings() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            listings_held_ = false;
+        }
+        listings_cv_.notify_all();
+    }
+
    private:
+    bool switchControllers(const controller_manager_msgs::srv::SwitchController::Request& request) {
+        const bool strict = request.strictness == controller_manager_msgs::srv::SwitchController::Request::STRICT;
+        std::vector<std::string> to_deactivate;
+        std::vector<std::string> to_activate;
+        for (const auto& name : request.deactivate_controllers) {
+            if (active_.count(name) > 0) {
+                to_deactivate.push_back(name);
+            } else if (strict) {
+                return false;
+            }
+        }
+        for (const auto& name : request.activate_controllers) {
+            if (active_.count(name) == 0) {
+                to_activate.push_back(name);
+            } else if (strict) {
+                return false;
+            }
+        }
+        bool ok = true;
+        for (const auto& name : to_deactivate) {
+            if (goal_handles_.count(name) > 0) {
+                ok = false;
+            } else {
+                active_.erase(name);
+            }
+        }
+        for (const auto& name : to_activate) {
+            active_.insert(name);
+        }
+        return ok;
+    }
+
     rclcpp_action::CancelResponse answerCancel(const std::string& controller) {
         log_.record(cancelEvent(controller));
         switch (config_.cancel_mode) {
-            case CancelMode::ACCEPT:
+            case CancelMode::ACCEPT: {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto it = goal_handles_.find(controller);
+                if (it != goal_handles_.end()) {
+                    cancelled_goal_handles_.push_back(it->second);
+                    goal_handles_.erase(it);
+                }
                 return rclcpp_action::CancelResponse::ACCEPT;
+            }
             case CancelMode::REJECT:
                 return rclcpp_action::CancelResponse::REJECT;
             case CancelMode::NEVER_ANSWER: {
@@ -243,8 +304,12 @@ class FakeRobot {
     std::mutex mutex_;
     std::condition_variable released_cv_;
     bool released_ = false;
+    std::condition_variable listings_cv_;
+    bool listings_held_ = false;
     std::map<std::string, std::shared_ptr<GoalHandle>> goal_handles_;
-    std::vector<std::string> deactivated_;
+    // Kept alive so a cancelled goal is not aborted by its handle's destructor
+    std::vector<std::shared_ptr<GoalHandle>> cancelled_goal_handles_;
+    std::set<std::string> active_;
     std::atomic<bool> controllers_loaded_;
     std::atomic<int> list_requests_{0};
 };
@@ -275,6 +340,7 @@ class ControllerStopperTest : public ::testing::Test {
     void TearDown() override {
         if (robot_) {
             robot_->releaseCancels();
+            robot_->releaseListings();
         }
         robot_executor_.cancel();
         action_executor_.cancel();
@@ -315,11 +381,6 @@ class ControllerStopperTest : public ::testing::Test {
         spinUntil([]() { return false; }, duration);
     }
 
-    bool deactivated(const std::string& controller) {
-        const auto names = robot_->deactivated();
-        return std::find(names.begin(), names.end(), controller) != names.end();
-    }
-
     EventLog log_;
     std::unique_ptr<FakeRobot> robot_;
     rclcpp::executors::SingleThreadedExecutor robot_executor_;
@@ -353,8 +414,8 @@ TEST_F(ControllerStopperTest, CancelsBeforeDeactivating) {
     ASSERT_TRUE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER))) << "the goal was never canceled";
     EXPECT_LT(log_.indexOf(cancelEvent(TRAJECTORY_CONTROLLER)), log_.indexOf("deactivate"))
         << "deactivating before the cancel is what the controller refuses";
-    EXPECT_TRUE(deactivated(TRAJECTORY_CONTROLLER));
-    EXPECT_FALSE(deactivated(CONSISTENT_CONTROLLER));
+    EXPECT_FALSE(robot_->isActive(TRAJECTORY_CONTROLLER));
+    EXPECT_TRUE(robot_->isActive(CONSISTENT_CONTROLLER));
 }
 
 // The topic is published every cycle, so `true` arrives constantly while the robot is already
@@ -373,7 +434,7 @@ TEST_F(ControllerStopperTest, IgnoresARepeatedTrueWhileTheRobotTaskRuns) {
 }
 
 // The stop is asynchronous now, so the topic can flip back to `true` while the cancels are still
-// being waited on: a brief RTSI dropout does exactly this. Before the cancel was added, the
+// being waited on: a brief drop of the external-control connection does exactly this. Before the cancel was added, the
 // deactivate went out synchronously and nothing could interleave. If the deferred deactivate lands
 // after the restart, the controllers end up inactive with the stopper believing the robot is
 // running, and no further `true` ever comes to bring them back.
@@ -404,6 +465,71 @@ TEST_F(ControllerStopperTest, DoesNotDeactivateWhenTheRobotTaskComesBackDuringTh
         << "the stop after a superseded stop never deactivated";
 }
 
+TEST_F(ControllerStopperTest, DoesNotDeactivateWhenTheRobotTaskComesBackWhileTheControllersAreListed) {
+    start();
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+    robot_->holdListings();
+    const int listed_before = robot_->listRequests();
+
+    robot_->publishTaskRunning(false);
+    spinFor(300ms);
+    ASSERT_GT(robot_->listRequests(), listed_before) << "the stop never asked for the controllers";
+    robot_->publishTaskRunning(true);
+    spinFor(300ms);
+    robot_->releaseListings();
+    spinFor(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(CANCEL_TIMEOUT_S * 3)));
+
+    EXPECT_FALSE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER))) << "the superseded stop still cancelled the goal";
+    EXPECT_FALSE(log_.contains("deactivate")) << "the superseded stop still deactivated the controllers";
+    EXPECT_FALSE(log_.contains("activate"));
+}
+
+TEST_F(ControllerStopperTest, RestartsTheStoppedControllersWhenTheRobotTaskComesBack) {
+    start();
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+    robot_->publishTaskRunning(false);
+    ASSERT_TRUE(spinUntil([this]() { return !robot_->isActive(TRAJECTORY_CONTROLLER); }, 10s))
+        << "controllers were never deactivated";
+
+    robot_->publishTaskRunning(true);
+
+    EXPECT_TRUE(spinUntil([this]() { return robot_->isActive(TRAJECTORY_CONTROLLER); }, 10s))
+        << "the stopped controller was never restarted";
+}
+
+// A STRICT activate is refused whole when one listed controller is still active, so the controller
+// that kept its goal would keep every other stopped controller down.
+TEST_F(ControllerStopperTest, RestartsTheControllersThatStoppedWhenOneKeptItsGoal) {
+    FakeRobotConfig config;
+    config.controllers = {{TRAJECTORY_CONTROLLER, true}, {NO_ACTION_CONTROLLER, false}, {CONSISTENT_CONTROLLER, false}};
+    config.cancel_mode = CancelMode::REJECT;
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+    robot_->publishTaskRunning(false);
+    ASSERT_TRUE(spinUntil([this]() { return !robot_->isActive(NO_ACTION_CONTROLLER); }, 10s))
+        << "controllers were never deactivated";
+    ASSERT_TRUE(robot_->isActive(TRAJECTORY_CONTROLLER)) << "the controller gave up a goal it was meant to keep";
+
+    robot_->publishTaskRunning(true);
+
+    EXPECT_TRUE(spinUntil([this]() { return robot_->isActive(NO_ACTION_CONTROLLER); }, 10s))
+        << "the controller that did stop was never restarted";
+}
+
+// The prime runs every 2 s, so a controller loaded just before a stop has no cancel client yet
+TEST_F(ControllerStopperTest, DeactivatesAControllerThePrimeHasNotSeenWithoutACancel) {
+    FakeRobotConfig config;
+    config.controllers_loaded = false;
+    start(config);
+    robot_->loadControllers();
+
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return !robot_->isActive(TRAJECTORY_CONTROLLER); }, 10s))
+        << "a controller with no cancel client was never deactivated";
+    EXPECT_FALSE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER)));
+}
+
 // An integer is the natural way to write the timeout in YAML or a launch dictionary. A statically
 // typed double declaration throws on it and takes the node down at startup, before it has stopped
 // anything.
@@ -431,7 +557,6 @@ TEST_F(ControllerStopperTest, DoesNotWaitForTheCancelWhenTheTimeoutIsZero) {
     const auto waited = std::chrono::steady_clock::now() - stopped_at;
     EXPECT_LT(waited, std::chrono::duration<double>(CANCEL_TIMEOUT_S))
         << "a zero timeout still waited for an answer that never came";
-    EXPECT_TRUE(deactivated(TRAJECTORY_CONTROLLER));
 }
 
 // Boot order on the robot: this node comes up with the driver, before the spawners have loaded
@@ -466,13 +591,13 @@ TEST_F(ControllerStopperTest, StillDeactivatesWhenTheCancelIsRefused) {
     ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s))
         << "a refused cancel stranded the deactivate";
     EXPECT_LT(log_.indexOf(cancelEvent(TRAJECTORY_CONTROLLER)), log_.indexOf("deactivate"));
-    EXPECT_TRUE(deactivated(TRAJECTORY_CONTROLLER));
 }
 
-// A wedged trajectory server must not keep every other stopped controller running: after the
-// timeout the deactivate goes ahead without its answer.
+// A wedged trajectory server keeps its goal and so stays active, but it must not keep the other
+// stopped controllers running: after the timeout the deactivate goes ahead, and the rest stop.
 TEST_F(ControllerStopperTest, DeactivatesAfterTheTimeoutWhenTheCancelIsNeverAnswered) {
     FakeRobotConfig config;
+    config.controllers = {{TRAJECTORY_CONTROLLER, true}, {NO_ACTION_CONTROLLER, false}, {CONSISTENT_CONTROLLER, false}};
     config.cancel_mode = CancelMode::NEVER_ANSWER;
     start(config);
     sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
@@ -486,7 +611,7 @@ TEST_F(ControllerStopperTest, DeactivatesAfterTheTimeoutWhenTheCancelIsNeverAnsw
     EXPECT_TRUE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER))) << "the cancel was never sent";
     EXPECT_GE(waited, std::chrono::duration<double>(CANCEL_TIMEOUT_S * 0.9))
         << "the deactivate did not wait for the cancel it was meant to wait for";
-    EXPECT_TRUE(deactivated(TRAJECTORY_CONTROLLER));
+    EXPECT_FALSE(robot_->isActive(NO_ACTION_CONTROLLER)) << "the controller holding a goal kept the others running";
     EXPECT_EQ(log_.count("deactivate"), 1u);
 }
 
@@ -508,8 +633,8 @@ TEST_F(ControllerStopperTest, CancelsEveryTrajectoryControllerBeforeASingleDeact
     EXPECT_LT(log_.indexOf(cancelEvent(TRAJECTORY_CONTROLLER)), log_.indexOf("deactivate"));
     EXPECT_LT(log_.indexOf(cancelEvent(SECOND_TRAJECTORY_CONTROLLER)), log_.indexOf("deactivate"));
     EXPECT_EQ(log_.count("deactivate"), 1u);
-    EXPECT_TRUE(deactivated(TRAJECTORY_CONTROLLER));
-    EXPECT_TRUE(deactivated(SECOND_TRAJECTORY_CONTROLLER));
+    EXPECT_FALSE(robot_->isActive(TRAJECTORY_CONTROLLER));
+    EXPECT_FALSE(robot_->isActive(SECOND_TRAJECTORY_CONTROLLER));
 }
 
 // A controller without a trajectory action gets a primed client that never becomes ready. It is
@@ -524,8 +649,8 @@ TEST_F(ControllerStopperTest, DeactivatesAControllerWithNoTrajectoryServerAlongs
 
     ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s)) << "controllers were never deactivated";
     EXPECT_LT(log_.indexOf(cancelEvent(TRAJECTORY_CONTROLLER)), log_.indexOf("deactivate"));
-    EXPECT_TRUE(deactivated(TRAJECTORY_CONTROLLER));
-    EXPECT_TRUE(deactivated(NO_ACTION_CONTROLLER));
+    EXPECT_FALSE(robot_->isActive(TRAJECTORY_CONTROLLER));
+    EXPECT_FALSE(robot_->isActive(NO_ACTION_CONTROLLER));
 }
 
 TEST_F(ControllerStopperTest, DeactivatesWithoutACancelWhenNoControllerHasATrajectoryServer) {
@@ -539,7 +664,7 @@ TEST_F(ControllerStopperTest, DeactivatesWithoutACancelWhenNoControllerHasATraje
 
     ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s))
         << "a controller with no trajectory server was never deactivated";
-    EXPECT_TRUE(deactivated(NO_ACTION_CONTROLLER));
+    EXPECT_FALSE(robot_->isActive(NO_ACTION_CONTROLLER));
 }
 
 // The prime timer repeats for the life of the stopper and captures `this`; once the stopper is gone,

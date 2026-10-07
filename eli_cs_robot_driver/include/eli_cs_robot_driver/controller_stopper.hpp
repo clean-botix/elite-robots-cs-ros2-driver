@@ -18,6 +18,7 @@
 
 #include <functional>
 #include <map>
+#include <set>
 
 class ControllerStopper {
    public:
@@ -60,9 +61,9 @@ class ControllerStopper {
      * action has no server to answer and is skipped.
      *
      * Best effort: `on_cancelled` runs once, when every cancel has answered (accepted or refused)
-     * or when `trajectory_cancel_timeout` seconds have passed, whichever comes first. A server that
-     * never answers must not keep the rest of the stopped controllers running, so on timeout the
-     * unanswered controllers are logged and the deactivate goes ahead anyway.
+     * or when `trajectory_cancel_timeout` seconds have passed, whichever comes first. On timeout
+     * the unanswered controllers are logged and the deactivate goes ahead anyway. A controller that
+     * still holds its goal then stays active, but the rest of the stopped controllers stop.
      *
      * This cancels goals this node did not send, which is well outside normal ROS 2 action usage.
      * It works around PickNik's joint_trajectory_admittance_controller refusing to deactivate
@@ -95,11 +96,12 @@ class ControllerStopper {
      * startControllers.
      *
      * The stop is now asynchronous: list controllers, cancel goals, wait for answers, deactivate.
-     * The status topic can flip back to `true` anywhere in that window (an RTSI dropout does it in
-     * well under a second). Without this, the deferred deactivate would land after the restart and
-     * leave the controllers inactive while robot_running_ says otherwise, with no further `true`
-     * coming to fix it. Each deferred step captures the generation it was issued under and does
-     * nothing if a later start or stop has moved it on.
+     * The status topic can flip back to `true` anywhere in that window (a brief drop of the
+     * external-control connection does it in well under a second). Without this, the deferred
+     * deactivate would land after the restart and leave the controllers inactive while
+     * robot_running_ says otherwise, with no further `true` coming to fix it. Each deferred step
+     * captures the generation it was issued under and does nothing if a later start or stop has
+     * moved it on.
      */
     uint64_t stop_generation_ = 0;
     // True from a stop being requested until its deactivate is sent. A start arriving in between
@@ -123,6 +125,9 @@ class ControllerStopper {
     // creating one per stop would rediscover the server every time.
     std::map<std::string, rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::SharedPtr>
         trajectory_action_clients_;
+    // Controllers whose trajectory server has been ready at least once. Only for these is a server
+    // that is not ready at a stop a fault; the others have no trajectory action.
+    std::set<std::string> trajectory_servers_seen_;
 
     std::vector<std::string> consistent_controllers_;
     std::vector<std::string> stopped_controllers_;
