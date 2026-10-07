@@ -25,13 +25,7 @@ class ControllerStopper {
     ControllerStopper() = delete;
     ControllerStopper(const rclcpp::Node::SharedPtr& node, bool stop_controllers_on_startup);
     /*!
-     * \brief Stops every timer and drops every pending request that captured `this`.
-     *
-     * The prime timer repeats for the life of the object, a cancel timeout may still be armed, and
-     * service and action callbacks may be pending; all of them call back into this object. rclcpp
-     * already frees them with their members, but only once the last reference goes -- and an
-     * executor mid-dispatch holds one. Cancelling them explicitly makes "nothing fires after
-     * destruction" not depend on that, since the node can outlive the stopper.
+     * \brief Cancels every timer and pending request that calls back into this object.
      */
     virtual ~ControllerStopper();
 
@@ -48,71 +42,40 @@ class ControllerStopper {
     void findAndStopControllers();
 
     /*!
-     * \brief Cancels any trajectory goal held by the controllers about to be deactivated, then
-     * runs `on_cancelled`.
+     * \brief Cancels the trajectory goals of the controllers about to stop, then runs `on_canceled`.
      *
-     * A controller holding an active FollowJointTrajectory goal refuses to deactivate, so the
-     * switch fails and the goal outlives the stop. It then reports success once its trajectory
-     * buffer drains, telling the caller a motion completed that the robot abandoned where it
-     * stood. Cancelling first lets the switch through and gives the caller the failure it is
-     * owed.
-     *
-     * Goals are cancelled on `<controller>/follow_joint_trajectory`. A controller with no such
-     * action has no server to answer and is skipped.
-     *
-     * Best effort: `on_cancelled` runs once, when every cancel has answered (accepted or refused)
-     * or when `trajectory_cancel_timeout` seconds have passed, whichever comes first. On timeout
-     * the unanswered controllers are logged and the deactivate goes ahead anyway. A controller that
-     * still holds its goal then stays active, but the rest of the stopped controllers stop.
-     *
-     * This cancels goals this node did not send, which is well outside normal ROS 2 action usage.
-     * It works around PickNik's joint_trajectory_admittance_controller refusing to deactivate
-     * while it holds a goal, and is to be removed once that is fixed (Linear SW-1330).
+     * PickNik's joint_trajectory_admittance_controller refuses to deactivate while it holds a goal.
+     * The goal then reports success for a motion the robot abandoned. This cancels goals another
+     * node sent. Normal ROS 2 action usage does not do that.
      */
-    void cancelTrajectoryGoals(const std::vector<std::string>& controllers, std::function<void()> on_cancelled);
+    void cancelTrajectoryGoals(const std::vector<std::string>& controllers, std::function<void()> on_canceled);
 
     /*!
-     * \brief Creates a trajectory action client for any controller that does not have one yet.
+     * \brief Creates a trajectory action client for each controller that has none yet.
      *
-     * Discovery is why this cannot wait until a stop arrives. A client created at that moment has
-     * not found its server yet, so it reports not ready, the cancel is skipped, and the deactivate
-     * fails exactly as it would with no cancel at all. There is no time to wait for discovery
-     * then: the goal reaches its terminal state a few hundred milliseconds after the stop.
-     *
-     * Nor is once at startup enough. This node comes up with the driver, before the spawners have
-     * loaded anything, so the first listing is empty. A timer repeats it until the controllers
-     * appear, which in practice is long before any protective stop.
+     * A client created at the stop has not discovered its server in time. The spawners load the
+     * controllers after this node starts. A timer therefore repeats the prime.
      */
     void primeTrajectoryActionClients();
 
-    rclcpp::TimerBase::SharedPtr prime_timer_;
-
-    // One per cancel still waiting for answers, removed when it finishes; see cancelTrajectoryGoals
-    std::vector<rclcpp::TimerBase::SharedPtr> cancel_timeout_timers_;
-    std::chrono::nanoseconds cancel_timeout_;
-
-    /*!
-     * \brief Which stop or start is current. Bumped by every findAndStopControllers and every
-     * startControllers.
-     *
-     * The stop is now asynchronous: list controllers, cancel goals, wait for answers, deactivate.
-     * The status topic can flip back to `true` anywhere in that window (a brief drop of the
-     * external-control connection does it in well under a second). Without this, the deferred
-     * deactivate would land after the restart and leave the controllers inactive while
-     * robot_running_ says otherwise, with no further `true` coming to fix it. Each deferred step
-     * captures the generation it was issued under and does nothing if a later start or stop has
-     * moved it on.
-     */
-    uint64_t stop_generation_ = 0;
-    // True from a stop being requested until its deactivate is sent. A start arriving in between
-    // has nothing to restart, because nothing was deactivated.
-    bool stop_pending_ = false;
+    bool isConsistent(const std::string& controller) const;
 
     /*!
      * \brief Starts the controllers stored in stopped_controllers_.
      *
      */
     void startControllers();
+
+    rclcpp::TimerBase::SharedPtr prime_timer_;
+    // One timer per stop that still waits for cancel answers
+    std::vector<rclcpp::TimerBase::SharedPtr> cancel_timeout_timers_;
+    std::chrono::nanoseconds cancel_timeout_;
+
+    // The status topic can return to `true` before a stop deactivates. Each deferred step of a stop
+    // checks its generation and does nothing once a later start or stop has moved it on.
+    uint64_t stop_generation_ = 0;
+    // The generation of the last stop that sent its deactivate
+    uint64_t deactivated_generation_ = 0;
 
     std::shared_ptr<rclcpp::Node> node_;
     rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr controller_manager_srv_;
@@ -121,12 +84,8 @@ class ControllerStopper {
 
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr robot_running_sub_;
 
-    // One action client per controller name, created on first use and reused afterwards:
-    // creating one per stop would rediscover the server every time.
-    std::map<std::string, rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::SharedPtr>
-        trajectory_action_clients_;
-    // Controllers whose trajectory server has been ready at least once. Only for these is a server
-    // that is not ready at a stop a fault; the others have no trajectory action.
+    std::map<std::string, rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::SharedPtr> trajectory_action_clients_;
+    // Controllers whose trajectory server has been ready at least once
     std::set<std::string> trajectory_servers_seen_;
 
     std::vector<std::string> consistent_controllers_;

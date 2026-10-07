@@ -247,8 +247,7 @@ if(BUILD_TESTING)
   target_include_directories(test_rt_sched PRIVATE include)
   ament_target_dependencies(test_rt_sched realtime_tools)
 
-  # The trajectory goal must be canceled before the controllers are deactivated, or the
-  # controller refuses the switch and the goal outlives the stop reporting success.
+  # ControllerStopper cancels trajectory goals before it deactivates controllers.
   ament_add_gtest(test_controller_stopper test/test_controller_stopper.cpp src/controller_stopper.cpp)
   target_include_directories(test_controller_stopper PRIVATE include)
   ament_target_dependencies(
