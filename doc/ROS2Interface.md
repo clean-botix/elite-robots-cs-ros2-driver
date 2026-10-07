@@ -151,6 +151,12 @@ The robot safety mode.
 #### *robot_task_running*[(std_msgs/msg/Bool)](https://docs.ros.org/en/api/std_msgs/html/msg/Bool.html)
 If running task and robot connected, the value is true. Else is false.
 
+> **Side effect: a `false` value cancels in-flight trajectory goals.** The [controller_stopper](../eli_cs_robot_driver/README.md#controller_stopper) cancels every goal on `<controller>/follow_joint_trajectory` before it deactivates that controller. Other nodes sent those goals, for example MoveIt Pro. Their senders see the goal end as *canceled*, not *succeeded*.
+>
+> This temporary workaround is outside normal ROS 2 action usage. Normally only the node that sent a goal cancels it. PickNik's `joint_trajectory_admittance_controller` refuses to deactivate while it holds a goal. Without the cancel, a protective stop leaves the goal alive. The goal later reports success for a motion the robot abandoned. [Linear SW-1330](https://linear.app/clean-botix/issue/SW-1330/) tracks the removal of the workaround.
+>
+> The topic is `true` only while the task status is *PLAYING* and the external control script is connected. That connection covers the script's reverse, trajectory and script command sockets. A brief drop of one socket drives the topic `false` and cancels a running goal. A pause also cancels the goal, and resuming does not restore it. If the topic returns to `true` before the deactivate, the controllers stay active. A goal already canceled stays canceled.
+
 ### Services
 
 #### *set_io*[(eli_common_interface/srv/SetIO)](/eli_common_interface/srv/SetIO.srv)
