@@ -127,8 +127,9 @@ ControllerStopper::~ControllerStopper() {
     robot_running_sub_.reset();
     controller_list_srv_->prune_pending_requests();
     controller_manager_srv_->prune_pending_requests();
-    // Dropping the action clients drops their pending cancel callbacks
-    trajectory_action_clients_.clear();
+    for (auto& [name, client] : trajectory_cancel_clients_) {
+        client->prune_pending_requests();
+    }
 }
 
 bool ControllerStopper::isConsistent(const std::string& controller) const {
@@ -189,18 +190,18 @@ void ControllerStopper::findAndStopControllers() {
 }
 
 void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& controllers, std::function<void()> on_canceled) {
-    using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
+    using CancelGoal = action_msgs::srv::CancelGoal;
 
     // A client created now would not discover its server in time
-    std::vector<std::pair<std::string, rclcpp_action::Client<FollowJointTrajectory>::SharedPtr>> to_cancel;
+    std::vector<std::pair<std::string, rclcpp::Client<CancelGoal>::SharedPtr>> to_cancel;
     for (const auto& controller : controllers) {
-        auto it = trajectory_action_clients_.find(controller);
-        if (it == trajectory_action_clients_.end()) {
+        auto it = trajectory_cancel_clients_.find(controller);
+        if (it == trajectory_cancel_clients_.end()) {
             RCLCPP_WARN(rclcpp::get_logger("Controller stopper"),
                         "No trajectory cancel client for '%s' yet; deactivating it without a cancel", controller.c_str());
             continue;
         }
-        if (it->second->action_server_is_ready()) {
+        if (it->second->service_is_ready()) {
             to_cancel.emplace_back(controller, it->second);
         } else if (trajectory_servers_seen_.count(controller) > 0) {
             RCLCPP_WARN(rclcpp::get_logger("Controller stopper"),
@@ -257,14 +258,17 @@ void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& co
     pending->timeout = timer;
     cancel_timeout_timers_.push_back(timer);
 
+    // A zero goal ID and a zero stamp cancel every goal
+    auto cancel_all = std::make_shared<CancelGoal::Request>();
     for (const auto& [controller, client] : to_cancel) {
-        client->async_cancel_all_goals([pending, finish, controller = controller](
-                                           const rclcpp_action::Client<FollowJointTrajectory>::CancelResponse::SharedPtr response) {
-            if (response->return_code == action_msgs::srv::CancelGoal::Response::ERROR_REJECTED) {
+        client->async_send_request(cancel_all, [pending, finish, controller = controller](
+                                                   rclcpp::Client<CancelGoal>::SharedFuture future) {
+            const auto response = future.get();
+            if (response->return_code == CancelGoal::Response::ERROR_REJECTED) {
                 // REJECTED means no goal or a refusal. A refusal surfaces as a failed deactivate.
                 RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
                             "Trajectory cancel for '%s' canceled nothing (no goal, or refused)", controller.c_str());
-            } else if (response->return_code != action_msgs::srv::CancelGoal::Response::ERROR_NONE) {
+            } else if (response->return_code != CancelGoal::Response::ERROR_NONE) {
                 RCLCPP_WARN(rclcpp::get_logger("Controller stopper"), "Trajectory cancel for '%s' answered with return code %d",
                             controller.c_str(), response->return_code);
             }
@@ -282,25 +286,25 @@ void ControllerStopper::primeTrajectoryActionClients() {
     controller_list_srv_->async_send_request(
         request, [this](rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedFuture future) {
             auto response = future.get();
-            for (const auto& [name, client] : trajectory_action_clients_) {
-                if (client->action_server_is_ready()) {
+            for (const auto& [name, client] : trajectory_cancel_clients_) {
+                if (client->service_is_ready()) {
                     trajectory_servers_seen_.insert(name);
                 }
             }
             std::size_t added = 0;
             for (const auto& controller : response->controller) {
-                if (trajectory_action_clients_.count(controller.name) > 0 || isConsistent(controller.name)) {
+                if (trajectory_cancel_clients_.count(controller.name) > 0 || isConsistent(controller.name)) {
                     continue;
                 }
-                trajectory_action_clients_.emplace(controller.name,
-                                                   rclcpp_action::create_client<control_msgs::action::FollowJointTrajectory>(
-                                                       node_, controller.name + "/follow_joint_trajectory"));
+                trajectory_cancel_clients_.emplace(controller.name,
+                                                   node_->create_client<action_msgs::srv::CancelGoal>(
+                                                       controller.name + "/follow_joint_trajectory/_action/cancel_goal"));
                 ++added;
             }
             if (added > 0) {
                 RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
                             "Prepared trajectory cancel clients for %zu new controller(s), %zu total", added,
-                            trajectory_action_clients_.size());
+                            trajectory_cancel_clients_.size());
             }
         });
 }

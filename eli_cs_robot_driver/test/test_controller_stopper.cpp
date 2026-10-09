@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <control_msgs/action/follow_joint_trajectory.hpp>
+#include <control_msgs/action/gripper_command.hpp>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <eli_common_interface/srv/get_robot_mode.hpp>
@@ -26,7 +27,9 @@
 #include "eli_cs_robot_driver/controller_stopper.hpp"
 
 using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
-using GoalHandle = rclcpp_action::ServerGoalHandle<FollowJointTrajectory>;
+// Stands in for the admittance controller's FollowJointTrajectoryWithAdmittance. Any other type proves the point.
+using OtherTrajectoryAction = control_msgs::action::GripperCommand;
+using GoalHandle = rclcpp_action::ServerGoalHandleBase;
 using namespace std::chrono_literals;
 
 namespace {
@@ -78,6 +81,8 @@ enum class CancelMode {
 struct FakeController {
     std::string name;
     bool has_trajectory_action;
+    // The server on `<name>/follow_joint_trajectory` is not a FollowJointTrajectory
+    bool other_action_type = false;
 };
 
 struct FakeRobotConfig {
@@ -141,17 +146,11 @@ class FakeRobot {
             if (!controller.has_trajectory_action) {
                 continue;
             }
-            const std::string name = controller.name;
-            action_servers_.push_back(rclcpp_action::create_server<FollowJointTrajectory>(
-                action_node_, name + "/follow_joint_trajectory",
-                [](const rclcpp_action::GoalUUID&, std::shared_ptr<const FollowJointTrajectory::Goal>) {
-                    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
-                },
-                [this, name](const std::shared_ptr<GoalHandle>) { return answerCancel(name); },
-                [this, name](const std::shared_ptr<GoalHandle> handle) {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    goal_handles_[name] = handle;
-                }));
+            if (controller.other_action_type) {
+                addTrajectoryServer<OtherTrajectoryAction>(controller.name);
+            } else {
+                addTrajectoryServer<FollowJointTrajectory>(controller.name);
+            }
         }
 
         task_running_pub_ = node_->create_publisher<std_msgs::msg::Bool>("io_and_status_controller/robot_task_running", 1);
@@ -202,6 +201,21 @@ class FakeRobot {
     }
 
    private:
+    template <typename ActionT>
+    void addTrajectoryServer(const std::string& name) {
+        using ServerGoalHandle = rclcpp_action::ServerGoalHandle<ActionT>;
+        action_servers_.push_back(rclcpp_action::create_server<ActionT>(
+            action_node_, name + "/follow_joint_trajectory",
+            [](const rclcpp_action::GoalUUID&, std::shared_ptr<const typename ActionT::Goal>) {
+                return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+            },
+            [this, name](const std::shared_ptr<ServerGoalHandle>) { return answerCancel(name); },
+            [this, name](const std::shared_ptr<ServerGoalHandle> handle) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                goal_handles_[name] = handle;
+            }));
+    }
+
     bool switchControllers(const controller_manager_msgs::srv::SwitchController::Request& request) {
         const bool strict = request.strictness == controller_manager_msgs::srv::SwitchController::Request::STRICT;
         std::vector<std::string> to_deactivate;
@@ -264,7 +278,7 @@ class FakeRobot {
     rclcpp::Service<controller_manager_msgs::srv::ListControllers>::SharedPtr list_srv_;
     rclcpp::Service<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_srv_;
     rclcpp::Service<eli_common_interface::srv::GetRobotMode>::SharedPtr mode_srv_;
-    std::vector<rclcpp_action::Server<FollowJointTrajectory>::SharedPtr> action_servers_;
+    std::vector<std::shared_ptr<rclcpp_action::ServerBase>> action_servers_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr task_running_pub_;
     std::mutex mutex_;
     std::condition_variable released_cv_;
@@ -314,10 +328,11 @@ class ControllerStopperTest : public ::testing::Test {
         stopper_.reset();
     }
 
+    template <typename ActionT = FollowJointTrajectory>
     void sendTrajectoryGoal(const std::string& controller) {
-        auto client = rclcpp_action::create_client<FollowJointTrajectory>(client_node_, controller + "/follow_joint_trajectory");
+        auto client = rclcpp_action::create_client<ActionT>(client_node_, controller + "/follow_joint_trajectory");
         ASSERT_TRUE(client->wait_for_action_server(10s)) << "fake trajectory action server never came up";
-        client->async_send_goal(FollowJointTrajectory::Goal());
+        client->async_send_goal(typename ActionT::Goal());
         ASSERT_TRUE(spinUntil([this, controller]() { return robot_->holdsGoal(controller); }, 10s))
             << "goal never reached the server";
         goal_clients_.push_back(client);
@@ -348,7 +363,7 @@ class ControllerStopperTest : public ::testing::Test {
     rclcpp::Node::SharedPtr client_node_;
     rclcpp::Node::SharedPtr stopper_node_;
     std::unique_ptr<ControllerStopper> stopper_;
-    std::vector<rclcpp_action::Client<FollowJointTrajectory>::SharedPtr> goal_clients_;
+    std::vector<std::shared_ptr<rclcpp_action::ClientBase>> goal_clients_;
 };
 
 TEST_F(ControllerStopperTest, CancelsTheTrajectoryGoalWhenTheRobotTaskStops) {
@@ -374,6 +389,22 @@ TEST_F(ControllerStopperTest, CancelsBeforeDeactivating) {
         << "deactivating before the cancel is what the controller refuses";
     EXPECT_FALSE(robot_->isActive(TRAJECTORY_CONTROLLER));
     EXPECT_TRUE(robot_->isActive(CONSISTENT_CONTROLLER));
+}
+
+TEST_F(ControllerStopperTest, CancelsAGoalOnAnActionThatIsNotAFollowJointTrajectory) {
+    FakeRobotConfig config;
+    config.controllers = {{TRAJECTORY_CONTROLLER, true, true}, {CONSISTENT_CONTROLLER, false}};
+    start(config);
+    sendTrajectoryGoal<OtherTrajectoryAction>(TRAJECTORY_CONTROLLER);
+
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s)) << "controllers were never deactivated";
+    ASSERT_TRUE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER)))
+        << "the admittance controller serves FollowJointTrajectoryWithAdmittance; a cancel bound to "
+           "FollowJointTrajectory never reaches it, and the controller refuses to deactivate";
+    EXPECT_LT(log_.indexOf(cancelEvent(TRAJECTORY_CONTROLLER)), log_.indexOf("deactivate"));
+    EXPECT_FALSE(robot_->isActive(TRAJECTORY_CONTROLLER));
 }
 
 TEST_F(ControllerStopperTest, IgnoresARepeatedTrueWhileTheRobotTaskRuns) {

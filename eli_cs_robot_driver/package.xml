@@ -13,6 +13,8 @@
   <test_depend>ament_lint_common</test_depend>
   <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>control_msgs</test_depend>
+  <test_depend>rclcpp_action</test_depend>
 
   <depend>backward_ros</depend>
   <depend>geometry_msgs</depend>
@@ -31,8 +33,7 @@
   <depend>hardware_interface</depend>
   <depend>pluginlib</depend>
   <depend>controller_manager_msgs</depend>
-  <depend>control_msgs</depend>
-  <depend>rclcpp_action</depend>
+  <depend>action_msgs</depend>
   <depend>controller_manager</depend>
   <depend>realtime_tools</depend>
   <depend>launch</depend>

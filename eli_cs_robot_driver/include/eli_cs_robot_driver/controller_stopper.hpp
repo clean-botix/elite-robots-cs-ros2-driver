@@ -9,11 +9,10 @@
 #include <string>
 #include <vector>
 
-#include <control_msgs/action/follow_joint_trajectory.hpp>
+#include <action_msgs/srv/cancel_goal.hpp>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp_action/rclcpp_action.hpp>
 #include <std_msgs/msg/bool.hpp>
 
 #include <functional>
@@ -47,11 +46,14 @@ class ControllerStopper {
      * PickNik's joint_trajectory_admittance_controller refuses to deactivate while it holds a goal.
      * The goal then reports success for a motion the robot abandoned. This cancels goals another
      * node sent. Normal ROS 2 action usage does not do that.
+     *
+     * The cancel goes to the action's cancel service, which has one type for every action. The
+     * admittance controller serves FollowJointTrajectoryWithAdmittance under the same name.
      */
     void cancelTrajectoryGoals(const std::vector<std::string>& controllers, std::function<void()> on_canceled);
 
     /*!
-     * \brief Creates a trajectory action client for each controller that has none yet.
+     * \brief Creates a trajectory cancel client for each controller that has none yet.
      *
      * A client created at the stop has not discovered its server in time. The spawners load the
      * controllers after this node starts. A timer therefore repeats the prime.
@@ -84,7 +86,7 @@ class ControllerStopper {
 
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr robot_running_sub_;
 
-    std::map<std::string, rclcpp_action::Client<control_msgs::action::FollowJointTrajectory>::SharedPtr> trajectory_action_clients_;
+    std::map<std::string, rclcpp::Client<action_msgs::srv::CancelGoal>::SharedPtr> trajectory_cancel_clients_;
     // Controllers whose trajectory server has been ready at least once
     std::set<std::string> trajectory_servers_seen_;
 
