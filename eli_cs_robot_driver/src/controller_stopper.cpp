@@ -1,11 +1,13 @@
 #include <algorithm>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <action_msgs/srv/cancel_goal.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/utilities.hpp>
 
 #include "eli_cs_robot_driver/controller_stopper.hpp"
@@ -65,6 +67,20 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
     RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "Service available");
 
     consistent_controllers_ = node_->declare_parameter<std::vector<std::string>>("consistent_controllers");
+
+    rcl_interfaces::msg::ParameterDescriptor cancel_timeout_descriptor;
+    cancel_timeout_descriptor.description = "Seconds a stop waits for trajectory cancels before it deactivates anyway.";
+    // A double declaration throws on an integer such as `2` from YAML. Dynamic typing accepts both.
+    cancel_timeout_descriptor.dynamic_typing = true;
+    const rclcpp::ParameterValue cancel_timeout_value =
+        node_->declare_parameter("trajectory_cancel_timeout", rclcpp::ParameterValue(1.0), cancel_timeout_descriptor);
+    const double cancel_timeout_s = cancel_timeout_value.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER
+                                        ? static_cast<double>(cancel_timeout_value.get<int64_t>())
+                                        : cancel_timeout_value.get<double>();
+    if (cancel_timeout_s < 0.0) {
+        throw std::invalid_argument("trajectory_cancel_timeout must not be negative");
+    }
+    cancel_timeout_ = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(cancel_timeout_s));
 
     primeTrajectoryActionClients();
     // The spawners load the controllers after this node starts
@@ -180,10 +196,12 @@ void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& co
     RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "Canceling trajectory goals on %zu controller(s) before deactivating",
                 to_cancel.size());
 
-    // on_canceled runs once, after the last answer
+    // on_canceled runs once. It runs after the last answer or after the timeout.
     struct PendingCancel {
         std::set<std::string> unanswered;
         std::function<void()> on_canceled;
+        rclcpp::TimerBase::WeakPtr timeout;
+        bool finished = false;
     };
     auto pending = std::make_shared<PendingCancel>();
     pending->on_canceled = std::move(on_canceled);
@@ -191,24 +209,49 @@ void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& co
         pending->unanswered.insert(entry.first);
     }
 
+    auto finish = [this, pending]() {
+        if (pending->finished) {
+            return;
+        }
+        pending->finished = true;
+        if (auto timer = pending->timeout.lock()) {
+            timer->cancel();
+            cancel_timeout_timers_.erase(std::remove(cancel_timeout_timers_.begin(), cancel_timeout_timers_.end(), timer),
+                                         cancel_timeout_timers_.end());
+        }
+        pending->on_canceled();
+    };
+
+    auto timer = node_->create_wall_timer(cancel_timeout_, [pending, finish]() {
+        if (pending->finished) {
+            return;
+        }
+        RCLCPP_WARN(rclcpp::get_logger("Controller stopper"), "Trajectory cancel got no answer from [%s] within the timeout",
+                    joinNames({pending->unanswered.begin(), pending->unanswered.end()}).c_str());
+        finish();
+    });
+    pending->timeout = timer;
+    cancel_timeout_timers_.push_back(timer);
+
     // A zero goal ID and a zero stamp cancel every goal
     auto cancel_all = std::make_shared<CancelGoal::Request>();
     for (const auto& [controller, client] : to_cancel) {
-        client->async_send_request(cancel_all, [pending, controller = controller](rclcpp::Client<CancelGoal>::SharedFuture future) {
-            const auto response = future.get();
-            if (response->return_code == CancelGoal::Response::ERROR_REJECTED) {
-                // REJECTED means no goal or a refusal. A refusal surfaces as a failed deactivate.
-                RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
-                            "Trajectory cancel for '%s' canceled nothing (no goal, or refused)", controller.c_str());
-            } else if (response->return_code != CancelGoal::Response::ERROR_NONE) {
-                RCLCPP_WARN(rclcpp::get_logger("Controller stopper"), "Trajectory cancel for '%s' answered with return code %d",
-                            controller.c_str(), response->return_code);
-            }
-            pending->unanswered.erase(controller);
-            if (pending->unanswered.empty()) {
-                pending->on_canceled();
-            }
-        });
+        client->async_send_request(
+            cancel_all, [pending, finish, controller = controller](rclcpp::Client<CancelGoal>::SharedFuture future) {
+                const auto response = future.get();
+                if (response->return_code == CancelGoal::Response::ERROR_REJECTED) {
+                    // REJECTED means no goal or a refusal. A refusal surfaces as a failed deactivate.
+                    RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
+                                "Trajectory cancel for '%s' canceled nothing (no goal, or refused)", controller.c_str());
+                } else if (response->return_code != CancelGoal::Response::ERROR_NONE) {
+                    RCLCPP_WARN(rclcpp::get_logger("Controller stopper"), "Trajectory cancel for '%s' answered with return code %d",
+                                controller.c_str(), response->return_code);
+                }
+                pending->unanswered.erase(controller);
+                if (pending->unanswered.empty()) {
+                    finish();
+                }
+            });
     }
 }
 

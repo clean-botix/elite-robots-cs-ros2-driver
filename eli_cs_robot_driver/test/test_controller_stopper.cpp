@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -38,6 +39,8 @@ constexpr char TRAJECTORY_CONTROLLER[] = "joint_trajectory_admittance_controller
 constexpr char SECOND_TRAJECTORY_CONTROLLER[] = "scaled_joint_trajectory_controller";
 constexpr char NO_ACTION_CONTROLLER[] = "forward_position_controller";
 constexpr char CONSISTENT_CONTROLLER[] = "joint_state_broadcaster";
+
+constexpr double CANCEL_TIMEOUT_S = 0.5;
 
 std::string cancelEvent(const std::string& controller) { return "cancel:" + controller; }
 
@@ -73,6 +76,7 @@ class EventLog {
 enum class CancelMode {
     ACCEPT,
     REJECT,
+    NEVER_ANSWER,
 };
 
 struct FakeController {
@@ -177,6 +181,14 @@ class FakeRobot {
 
     int goalsAccepted() const { return goals_accepted_.load(); }
 
+    void releaseCancels() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        released_cv_.notify_all();
+    }
+
    private:
     template <typename ActionT>
     void addTrajectoryServer(const std::string& name) {
@@ -240,6 +252,11 @@ class FakeRobot {
             }
             case CancelMode::REJECT:
                 return rclcpp_action::CancelResponse::REJECT;
+            case CancelMode::NEVER_ANSWER: {
+                std::unique_lock<std::mutex> lock(mutex_);
+                released_cv_.wait(lock, [this]() { return released_; });
+                return rclcpp_action::CancelResponse::REJECT;
+            }
         }
         return rclcpp_action::CancelResponse::REJECT;
     }
@@ -254,6 +271,8 @@ class FakeRobot {
     std::vector<std::shared_ptr<rclcpp_action::ServerBase>> action_servers_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr task_running_pub_;
     std::mutex mutex_;
+    std::condition_variable released_cv_;
+    bool released_ = false;
     // Every accepted goal; a handle this fake drops is a goal the server forgets
     std::multimap<std::string, std::shared_ptr<GoalHandle>> goal_handles_;
     std::vector<std::shared_ptr<GoalHandle>> canceled_goal_handles_;
@@ -265,7 +284,8 @@ class FakeRobot {
 
 class ControllerStopperTest : public ::testing::Test {
    protected:
-    void start(FakeRobotConfig config = FakeRobotConfig()) {
+    void start(FakeRobotConfig config = FakeRobotConfig(),
+               rclcpp::ParameterValue cancel_timeout = rclcpp::ParameterValue(CANCEL_TIMEOUT_S)) {
         robot_ = std::make_unique<FakeRobot>(log_, std::move(config));
         client_node_ = std::make_shared<rclcpp::Node>("trajectory_goal_sender");
         robot_executor_.add_node(robot_->node());
@@ -275,13 +295,17 @@ class ControllerStopperTest : public ::testing::Test {
         action_thread_ = std::thread([this]() { action_executor_.spin(); });
 
         rclcpp::NodeOptions options;
-        options.parameter_overrides({rclcpp::Parameter("consistent_controllers", std::vector<std::string>{CONSISTENT_CONTROLLER})});
+        options.parameter_overrides({rclcpp::Parameter("consistent_controllers", std::vector<std::string>{CONSISTENT_CONTROLLER}),
+                                     rclcpp::Parameter("trajectory_cancel_timeout", cancel_timeout)});
         stopper_node_ = std::make_shared<rclcpp::Node>("controller_stopper_under_test", options);
 
         stopper_ = std::make_unique<ControllerStopper>(stopper_node_, false);
     }
 
     void TearDown() override {
+        if (robot_) {
+            robot_->releaseCancels();
+        }
         robot_executor_.cancel();
         action_executor_.cancel();
         if (robot_thread_.joinable()) {
@@ -437,6 +461,20 @@ TEST_F(ControllerStopperTest, DeactivatesAControllerThePrimeHasNotSeenWithoutACa
     EXPECT_FALSE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER)));
 }
 
+TEST_F(ControllerStopperTest, AcceptsAnIntegerCancelTimeout) {
+    ASSERT_NO_THROW(start(FakeRobotConfig(), rclcpp::ParameterValue(static_cast<int64_t>(1))));
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    robot_->publishTaskRunning(false);
+
+    EXPECT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s))
+        << "the stopper did not work with an integer timeout";
+}
+
+TEST_F(ControllerStopperTest, RejectsANegativeCancelTimeout) {
+    EXPECT_THROW(start(FakeRobotConfig(), rclcpp::ParameterValue(-1.0)), std::invalid_argument);
+}
+
 TEST_F(ControllerStopperTest, CancelsAControllerThatLoadedAfterStartup) {
     FakeRobotConfig config;
     config.controllers_loaded = false;
@@ -463,6 +501,39 @@ TEST_F(ControllerStopperTest, StillDeactivatesWhenTheCancelIsRefused) {
 
     ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s)) << "a refused cancel stranded the deactivate";
     EXPECT_LT(log_.indexOf(cancelEvent(TRAJECTORY_CONTROLLER)), log_.indexOf("deactivate"));
+}
+
+TEST_F(ControllerStopperTest, DeactivatesAfterTheTimeoutWhenTheCancelIsNeverAnswered) {
+    FakeRobotConfig config;
+    config.controllers = {{TRAJECTORY_CONTROLLER, true}, {NO_ACTION_CONTROLLER, false}, {CONSISTENT_CONTROLLER, false}};
+    config.cancel_mode = CancelMode::NEVER_ANSWER;
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    const auto stopped_at = std::chrono::steady_clock::now();
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s))
+        << "an unanswered cancel blocked the deactivate indefinitely";
+    const auto waited = std::chrono::steady_clock::now() - stopped_at;
+    EXPECT_TRUE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER))) << "the cancel was never sent";
+    EXPECT_GE(waited, std::chrono::duration<double>(CANCEL_TIMEOUT_S * 0.9))
+        << "the deactivate did not wait for the cancel it was meant to wait for";
+    EXPECT_EQ(log_.count("deactivate"), 1u);
+}
+
+TEST_F(ControllerStopperTest, ALateCancelAnswerDoesNotDeactivateAgain) {
+    FakeRobotConfig config;
+    config.cancel_mode = CancelMode::NEVER_ANSWER;
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+    robot_->publishTaskRunning(false);
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s)) << "the timeout never deactivated";
+
+    robot_->releaseCancels();
+    spinFor(1s);
+
+    EXPECT_EQ(log_.count("deactivate"), 1u) << "the answer that arrived after the timeout deactivated a second time";
 }
 
 TEST_F(ControllerStopperTest, CancelsEveryTrajectoryControllerBeforeASingleDeactivate) {

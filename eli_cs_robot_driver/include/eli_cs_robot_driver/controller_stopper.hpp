@@ -3,6 +3,7 @@
 
 #include "eli_common_interface/srv/get_robot_mode.hpp"
 
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -63,6 +64,9 @@ class ControllerStopper {
     void startControllers();
 
     rclcpp::TimerBase::SharedPtr prime_timer_;
+    // One timer per stop that still waits for cancel answers
+    std::vector<rclcpp::TimerBase::SharedPtr> cancel_timeout_timers_;
+    std::chrono::nanoseconds cancel_timeout_;
 
     std::shared_ptr<rclcpp::Node> node_;
     rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr controller_manager_srv_;
