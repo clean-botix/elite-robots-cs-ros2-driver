@@ -120,6 +120,7 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
             RCLCPP_ERROR(rclcpp::get_logger("Controller stopper"), "Could not deactivate requested controllers");
         }
         robot_running_ = false;
+        deactivated_generation_ = stop_generation_;
     }
 }
 
@@ -142,6 +143,7 @@ bool ControllerStopper::isConsistent(const std::string& controller) const {
 
 void ControllerStopper::findAndStopControllers() {
     stopped_controllers_.clear();
+    const uint64_t generation = ++stop_generation_;
     auto request_switch_controller = std::make_shared<controller_manager_msgs::srv::SwitchController::Request>();
     auto request_list_controllers = std::make_shared<controller_manager_msgs::srv::ListControllers::Request>();
 
@@ -160,8 +162,13 @@ void ControllerStopper::findAndStopControllers() {
 
     // Callback to list controllers
     auto callback_list_controller =
-        [this, request_switch_controller,
+        [this, generation, request_switch_controller,
          callback_switch_controller](rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedFuture future_response) {
+            if (generation != stop_generation_) {
+                RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
+                            "Robot task came back before the controllers were listed; not stopping them");
+                return;
+            }
             auto result = future_response.get();
             for (auto& controller : result->controller) {
                 if (controller.state == "active" && !isConsistent(controller.name)) {
@@ -173,11 +180,19 @@ void ControllerStopper::findAndStopControllers() {
             }
             request_switch_controller->strictness = request_switch_controller->STRICT;
             request_switch_controller->deactivate_controllers = stopped_controllers_;
-            cancelTrajectoryGoals(stopped_controllers_, [this, request_switch_controller, callback_switch_controller]() {
-                RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "Deactivating [%s]",
-                            joinNames(request_switch_controller->deactivate_controllers).c_str());
-                controller_manager_srv_->async_send_request(request_switch_controller, callback_switch_controller);
-            });
+            cancelTrajectoryGoals(
+                stopped_controllers_, [this, generation, request_switch_controller, callback_switch_controller]() {
+                    if (generation != stop_generation_) {
+                        RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
+                                    "Robot task came back while trajectory goals were being canceled; "
+                                    "leaving the controllers active");
+                        return;
+                    }
+                    deactivated_generation_ = generation;
+                    RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "Deactivating [%s]",
+                                joinNames(request_switch_controller->deactivate_controllers).c_str());
+                    controller_manager_srv_->async_send_request(request_switch_controller, callback_switch_controller);
+                });
         };
 
     auto future = controller_list_srv_->async_send_request(request_list_controllers, callback_list_controller);
@@ -299,19 +314,23 @@ void ControllerStopper::primeTrajectoryActionClients() {
 }
 
 void ControllerStopper::startControllers() {
-    // Callback to switch controllers
-    auto callback = [this](rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedFuture future_response) {
-        auto result = future_response.get();
-        if (result->ok == false) {
-            RCLCPP_ERROR(rclcpp::get_logger("Controller stopper"), "Could not activate requested controllers");
+    const bool current_stop_deactivated = deactivated_generation_ == stop_generation_;
+    ++stop_generation_;
+    if (!current_stop_deactivated) {
+        RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "No controllers were deactivated; nothing to restart");
+        return;
+    }
+    auto request = std::make_shared<controller_manager_msgs::srv::SwitchController::Request>();
+    request->strictness = request->STRICT;
+    request->activate_controllers = stopped_controllers_;
+    RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "Restarting [%s]", joinNames(stopped_controllers_).c_str());
+    auto callback = [request](rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedFuture future_response) {
+        if (future_response.get()->ok == false) {
+            RCLCPP_ERROR(rclcpp::get_logger("Controller stopper"), "Could not activate all of [%s]",
+                         joinNames(request->activate_controllers).c_str());
         }
     };
-    if (!stopped_controllers_.empty()) {
-        auto request = std::make_shared<controller_manager_msgs::srv::SwitchController::Request>();
-        request->strictness = request->STRICT;
-        request->activate_controllers = stopped_controllers_;
-        auto future = controller_manager_srv_->async_send_request(request, callback);
-    }
+    controller_manager_srv_->async_send_request(request, callback);
 }
 
 void ControllerStopper::robotRunningCallback(const std_msgs::msg::Bool::ConstSharedPtr msg) {

@@ -110,7 +110,8 @@ class FakeRobot {
             [this](const controller_manager_msgs::srv::ListControllers::Request::SharedPtr,
                    controller_manager_msgs::srv::ListControllers::Response::SharedPtr response) {
                 list_requests_.fetch_add(1);
-                std::lock_guard<std::mutex> lock(mutex_);
+                std::unique_lock<std::mutex> lock(mutex_);
+                listings_cv_.wait(lock, [this]() { return !listings_held_; });
                 if (!controllers_loaded_.load()) {
                     return;
                 }
@@ -187,6 +188,19 @@ class FakeRobot {
             released_ = true;
         }
         released_cv_.notify_all();
+    }
+
+    void holdListings() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        listings_held_ = true;
+    }
+
+    void releaseListings() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            listings_held_ = false;
+        }
+        listings_cv_.notify_all();
     }
 
    private:
@@ -273,6 +287,8 @@ class FakeRobot {
     std::mutex mutex_;
     std::condition_variable released_cv_;
     bool released_ = false;
+    std::condition_variable listings_cv_;
+    bool listings_held_ = false;
     // Every accepted goal; a handle this fake drops is a goal the server forgets
     std::multimap<std::string, std::shared_ptr<GoalHandle>> goal_handles_;
     std::vector<std::shared_ptr<GoalHandle>> canceled_goal_handles_;
@@ -305,6 +321,7 @@ class ControllerStopperTest : public ::testing::Test {
     void TearDown() override {
         if (robot_) {
             robot_->releaseCancels();
+            robot_->releaseListings();
         }
         robot_executor_.cancel();
         action_executor_.cancel();
@@ -434,6 +451,48 @@ TEST_F(ControllerStopperTest, IgnoresARepeatedTrueWhileTheRobotTaskRuns) {
     EXPECT_FALSE(log_.contains("activate"));
 }
 
+TEST_F(ControllerStopperTest, DoesNotDeactivateWhenTheRobotTaskComesBackDuringTheCancel) {
+    FakeRobotConfig config;
+    config.cancel_mode = CancelMode::NEVER_ANSWER;
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    robot_->publishTaskRunning(false);
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains(cancelEvent(TRAJECTORY_CONTROLLER)); }, 10s))
+        << "the cancel was never sent, so the window under test was never open";
+    ASSERT_FALSE(log_.contains("deactivate")) << "the deactivate did not wait for the cancel; nothing to race";
+
+    robot_->publishTaskRunning(true);
+    spinFor(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(CANCEL_TIMEOUT_S * 3)));
+
+    EXPECT_FALSE(log_.contains("deactivate")) << "the deferred deactivate landed after the restart, leaving the controllers dead";
+    EXPECT_FALSE(log_.contains("activate")) << "nothing was deactivated, so there was nothing to activate";
+
+    robot_->releaseCancels();
+    robot_->publishTaskRunning(false);
+    EXPECT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s))
+        << "the stop after a superseded stop never deactivated";
+}
+
+TEST_F(ControllerStopperTest, DoesNotDeactivateWhenTheRobotTaskComesBackWhileTheControllersAreListed) {
+    start();
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+    robot_->holdListings();
+    const int listed_before = robot_->listRequests();
+
+    robot_->publishTaskRunning(false);
+    spinFor(300ms);
+    ASSERT_GT(robot_->listRequests(), listed_before) << "no listing was in flight, so the window under test never opened";
+    robot_->publishTaskRunning(true);
+    spinFor(300ms);
+    robot_->releaseListings();
+    spinFor(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(CANCEL_TIMEOUT_S * 3)));
+
+    EXPECT_FALSE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER))) << "the superseded stop still canceled the goal";
+    EXPECT_FALSE(log_.contains("deactivate")) << "the superseded stop still deactivated the controllers";
+    EXPECT_FALSE(log_.contains("activate"));
+}
+
 TEST_F(ControllerStopperTest, RestartsTheStoppedControllersWhenTheRobotTaskComesBack) {
     start();
     sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
@@ -445,6 +504,22 @@ TEST_F(ControllerStopperTest, RestartsTheStoppedControllersWhenTheRobotTaskComes
 
     EXPECT_TRUE(spinUntil([this]() { return robot_->isActive(TRAJECTORY_CONTROLLER); }, 10s))
         << "the stopped controller was never restarted";
+}
+
+TEST_F(ControllerStopperTest, RestartsTheControllersOnEveryStopStartCycle) {
+    start();
+
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        robot_->publishTaskRunning(false);
+        ASSERT_TRUE(spinUntil([this]() { return !robot_->isActive(TRAJECTORY_CONTROLLER); }, 10s))
+            << "cycle " << cycle << ": controllers were never deactivated";
+        robot_->publishTaskRunning(true);
+        ASSERT_TRUE(spinUntil([this]() { return robot_->isActive(TRAJECTORY_CONTROLLER); }, 10s))
+            << "cycle " << cycle << ": the stopped controller was never restarted";
+    }
+
+    EXPECT_EQ(log_.count("deactivate"), 2u);
+    EXPECT_EQ(log_.count("activate"), 2u);
 }
 
 TEST_F(ControllerStopperTest, DeactivatesAControllerThePrimeHasNotSeenWithoutACancel) {

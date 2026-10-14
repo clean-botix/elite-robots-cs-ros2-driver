@@ -4,6 +4,7 @@
 #include "eli_common_interface/srv/get_robot_mode.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -70,6 +71,12 @@ class ControllerStopper {
     // One timer per stop that still waits for cancel answers
     std::vector<rclcpp::TimerBase::SharedPtr> cancel_timeout_timers_;
     std::chrono::nanoseconds cancel_timeout_;
+
+    // The status topic can return to `true` before a stop deactivates. Each deferred step of a stop
+    // checks its generation and does nothing once a later start or stop has moved it on.
+    uint64_t stop_generation_ = 0;
+    // The generation of the last stop that sent its deactivate
+    uint64_t deactivated_generation_ = 0;
 
     std::shared_ptr<rclcpp::Node> node_;
     rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr controller_manager_srv_;
