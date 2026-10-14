@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -43,6 +44,7 @@ constexpr char CONSISTENT_CONTROLLER[] = "joint_state_broadcaster";
 constexpr double CANCEL_TIMEOUT_S = 0.5;
 
 std::string cancelEvent(const std::string& controller) { return "cancel:" + controller; }
+std::string goalEndedEvent(const std::string& controller) { return "goal_ended:" + controller; }
 
 class EventLog {
    public:
@@ -89,11 +91,23 @@ struct FakeController {
 struct FakeRobotConfig {
     std::vector<FakeController> controllers{{TRAJECTORY_CONTROLLER, true}, {CONSISTENT_CONTROLLER, false}};
     CancelMode cancel_mode = CancelMode::ACCEPT;
+    // An accepted cancel ends the goal this long after the answer, as a controller does in a later
+    // update cycle. nullopt never ends it.
+    std::optional<std::chrono::milliseconds> goal_ends_after = std::chrono::milliseconds(20);
+    // The goal's sender answers an accepted cancel with the next goal at once, as MoveIt Pro's
+    // trajectory behavior does with the next segment; this many times per controller
+    int resend_goals_on_cancel = 0;
     bool controllers_loaded = true;
 };
 
+struct HeldGoal {
+    std::shared_ptr<GoalHandle> handle;
+    std::function<void()> end;
+};
+
 // The controller manager follows controller_manager 2.53.1. STRICT refuses a whole request that lists
-// a controller already in the requested state. A controller that holds a goal refuses to deactivate.
+// a controller already in the requested state. A controller that holds a goal refuses to deactivate,
+// and a goal is held until it ends, not until its cancel is accepted.
 class FakeRobot {
    public:
     FakeRobot(EventLog& log, FakeRobotConfig config)
@@ -207,15 +221,19 @@ class FakeRobot {
     template <typename ActionT>
     void addTrajectoryServer(const std::string& name) {
         using ServerGoalHandle = rclcpp_action::ServerGoalHandle<ActionT>;
+        auto client = rclcpp_action::create_client<ActionT>(action_node_, name + "/follow_joint_trajectory");
+        resend_[name] = [client]() { client->async_send_goal(typename ActionT::Goal()); };
+        goal_clients_.push_back(client);
         action_servers_.push_back(rclcpp_action::create_server<ActionT>(
             action_node_, name + "/follow_joint_trajectory",
             [](const rclcpp_action::GoalUUID&, std::shared_ptr<const typename ActionT::Goal>) {
                 return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
             },
-            [this, name](const std::shared_ptr<ServerGoalHandle>) { return answerCancel(name); },
+            [this, name](const std::shared_ptr<ServerGoalHandle> handle) { return answerCancel(name, handle); },
             [this, name](const std::shared_ptr<ServerGoalHandle> handle) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                goal_handles_.emplace(name, handle);
+                goal_handles_.emplace(
+                    name, HeldGoal{handle, [handle]() { handle->canceled(std::make_shared<typename ActionT::Result>()); }});
                 goals_accepted_.fetch_add(1);
             }));
     }
@@ -252,15 +270,37 @@ class FakeRobot {
         return ok;
     }
 
-    rclcpp_action::CancelResponse answerCancel(const std::string& controller) {
+    // Runs on the action executor once the server has moved the goal to CANCELING
+    void endGoalLater(const std::string& controller, const HeldGoal& goal, std::chrono::milliseconds delay) {
+        auto timer = std::make_shared<rclcpp::TimerBase::SharedPtr>();
+        *timer = action_node_->create_wall_timer(delay, [this, controller, goal, timer]() {
+            (*timer)->cancel();
+            timer->reset();
+            goal.end();
+            log_.record(goalEndedEvent(controller));
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = goal_handles_.lower_bound(controller); it != goal_handles_.upper_bound(controller); ++it) {
+                if (it->second.handle == goal.handle) {
+                    goal_handles_.erase(it);
+                    break;
+                }
+            }
+        });
+    }
+
+    rclcpp_action::CancelResponse answerCancel(const std::string& controller, const std::shared_ptr<GoalHandle>& handle) {
         log_.record(cancelEvent(controller));
         switch (config_.cancel_mode) {
             case CancelMode::ACCEPT: {
                 std::lock_guard<std::mutex> lock(mutex_);
-                auto it = goal_handles_.find(controller);
-                if (it != goal_handles_.end()) {
-                    canceled_goal_handles_.push_back(it->second);
-                    goal_handles_.erase(it);
+                for (auto it = goal_handles_.lower_bound(controller); it != goal_handles_.upper_bound(controller); ++it) {
+                    if (it->second.handle == handle && config_.goal_ends_after) {
+                        endGoalLater(controller, it->second, *config_.goal_ends_after);
+                    }
+                }
+                if (resent_count_[controller] < config_.resend_goals_on_cancel) {
+                    ++resent_count_[controller];
+                    resend_[controller]();
                 }
                 return rclcpp_action::CancelResponse::ACCEPT;
             }
@@ -283,15 +323,17 @@ class FakeRobot {
     rclcpp::Service<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_srv_;
     rclcpp::Service<eli_common_interface::srv::GetRobotMode>::SharedPtr mode_srv_;
     std::vector<std::shared_ptr<rclcpp_action::ServerBase>> action_servers_;
+    std::vector<std::shared_ptr<rclcpp_action::ClientBase>> goal_clients_;
+    std::map<std::string, std::function<void()>> resend_;
+    std::map<std::string, int> resent_count_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr task_running_pub_;
     std::mutex mutex_;
     std::condition_variable released_cv_;
     bool released_ = false;
     std::condition_variable listings_cv_;
     bool listings_held_ = false;
-    // Every accepted goal; a handle this fake drops is a goal the server forgets
-    std::multimap<std::string, std::shared_ptr<GoalHandle>> goal_handles_;
-    std::vector<std::shared_ptr<GoalHandle>> canceled_goal_handles_;
+    // Every goal that has not ended; a handle this fake drops is a goal the server forgets
+    std::multimap<std::string, HeldGoal> goal_handles_;
     std::set<std::string> active_;
     std::atomic<bool> controllers_loaded_;
     std::atomic<int> list_requests_{0};
@@ -359,6 +401,18 @@ class ControllerStopperTest : public ::testing::Test {
 
     void spinFor(std::chrono::nanoseconds duration) {
         spinUntil([]() { return false; }, duration);
+    }
+
+    // Live timers on the stopper's node: the prime timer plus any stop that still holds its timeout
+    std::size_t liveTimersOnStopperNode() {
+        std::size_t count = 0;
+        auto visit = [&count](const rclcpp::TimerBase::SharedPtr&) {
+            ++count;
+            return false;
+        };
+        stopper_node_->for_each_callback_group(
+            [&visit](rclcpp::CallbackGroup::SharedPtr group) { group->find_timer_ptrs_if(visit); });
+        return count;
     }
 
     void waitForPrimeTick() {
@@ -595,6 +649,127 @@ TEST_F(ControllerStopperTest, StillDeactivatesWhenTheCancelIsRefused) {
     EXPECT_LT(log_.indexOf(cancelEvent(TRAJECTORY_CONTROLLER)), log_.indexOf("deactivate"));
 }
 
+TEST_F(ControllerStopperTest, WaitsForTheCanceledGoalToEndBeforeDeactivating) {
+    FakeRobotConfig config;
+    config.goal_ends_after = std::chrono::milliseconds(200);
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s)) << "controllers were never deactivated";
+    ASSERT_TRUE(log_.contains(goalEndedEvent(TRAJECTORY_CONTROLLER))) << "the accepted cancel never ended the goal";
+    EXPECT_LT(log_.indexOf(goalEndedEvent(TRAJECTORY_CONTROLLER)), log_.indexOf("deactivate"))
+        << "the cancel answer only says the server accepted it; a deactivate before the goal ends is refused";
+    EXPECT_FALSE(robot_->isActive(TRAJECTORY_CONTROLLER));
+    EXPECT_EQ(log_.count("deactivate"), 1u);
+}
+
+TEST_F(ControllerStopperTest, CancelsAGoalAcceptedWhileTheFirstWasEndingBeforeDeactivating) {
+    FakeRobotConfig config;
+    config.resend_goals_on_cancel = 1;
+    config.goal_ends_after = std::chrono::milliseconds(100);
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s)) << "controllers were never deactivated";
+    spinFor(300ms);
+    EXPECT_GE(log_.count(cancelEvent(TRAJECTORY_CONTROLLER)), 2u)
+        << "the goal accepted after the first cancel was never canceled, so it outlives the deactivate";
+    EXPECT_FALSE(robot_->holdsGoal(TRAJECTORY_CONTROLLER)) << "a goal was left on the controller";
+    EXPECT_FALSE(robot_->isActive(TRAJECTORY_CONTROLLER)) << "the deactivate ran while the controller still held a goal";
+    EXPECT_EQ(log_.count("deactivate"), 1u);
+}
+
+TEST_F(ControllerStopperTest, CancelsEachGoalOnceWhileAnEarlierOneIsStillEnding) {
+    FakeRobotConfig config;
+    config.resend_goals_on_cancel = 1;
+    // The first goal is still ending when the second cancel answers
+    config.goal_ends_after = std::chrono::milliseconds(300);
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s)) << "controllers were never deactivated";
+    spinFor(300ms);
+    EXPECT_EQ(log_.count(cancelEvent(TRAJECTORY_CONTROLLER)), 2u)
+        << "a goal already ending from the first cancel was canceled again on every status update";
+    EXPECT_FALSE(robot_->holdsGoal(TRAJECTORY_CONTROLLER));
+    EXPECT_FALSE(robot_->isActive(TRAJECTORY_CONTROLLER));
+}
+
+TEST_F(ControllerStopperTest, DeactivatesAtTheTimeoutWhenTheSenderAnswersEveryCancelWithAGoal) {
+    FakeRobotConfig config;
+    config.resend_goals_on_cancel = 1000;
+    config.goal_ends_after = std::chrono::milliseconds(20);
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    const auto stopped_at = std::chrono::steady_clock::now();
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s))
+        << "a sender that never stops kept the deactivate from ever running";
+    const auto waited = std::chrono::steady_clock::now() - stopped_at;
+    EXPECT_GE(waited, std::chrono::duration<double>(CANCEL_TIMEOUT_S * 0.9)) << "the stopper gave up before the timeout";
+    EXPECT_GE(log_.count(cancelEvent(TRAJECTORY_CONTROLLER)), 3u) << "each new goal was not canceled in turn";
+    EXPECT_EQ(log_.count("deactivate"), 1u);
+}
+
+TEST_F(ControllerStopperTest, WaitsForTheRacingControllerWithoutHoldingUpTheQuietOne) {
+    FakeRobotConfig config;
+    config.controllers = {{TRAJECTORY_CONTROLLER, true}, {SECOND_TRAJECTORY_CONTROLLER, true}, {CONSISTENT_CONTROLLER, false}};
+    config.resend_goals_on_cancel = 1;
+    config.goal_ends_after = std::chrono::milliseconds(100);
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+    sendTrajectoryGoal(SECOND_TRAJECTORY_CONTROLLER);
+
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s)) << "controllers were never deactivated";
+    spinFor(300ms);
+    EXPECT_EQ(log_.count("deactivate"), 1u) << "the two controllers were not stopped in one switch";
+    EXPECT_FALSE(robot_->holdsGoal(TRAJECTORY_CONTROLLER));
+    EXPECT_FALSE(robot_->holdsGoal(SECOND_TRAJECTORY_CONTROLLER));
+    EXPECT_FALSE(robot_->isActive(TRAJECTORY_CONTROLLER));
+    EXPECT_FALSE(robot_->isActive(SECOND_TRAJECTORY_CONTROLLER));
+}
+
+TEST_F(ControllerStopperTest, DeactivatesAfterTheTimeoutWhenTheCanceledGoalNeverEnds) {
+    FakeRobotConfig config;
+    config.goal_ends_after = std::nullopt;
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+
+    const auto stopped_at = std::chrono::steady_clock::now();
+    robot_->publishTaskRunning(false);
+
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s))
+        << "a goal that never ended blocked the deactivate indefinitely";
+    const auto waited = std::chrono::steady_clock::now() - stopped_at;
+    EXPECT_TRUE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER)));
+    EXPECT_GE(waited, std::chrono::duration<double>(CANCEL_TIMEOUT_S * 0.9))
+        << "the deactivate did not wait for the goal it was meant to wait for";
+    EXPECT_EQ(log_.count("deactivate"), 1u);
+}
+
+TEST_F(ControllerStopperTest, ReleasesTheCancelTimerOnceTheStopFinishes) {
+    start();
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+    const std::size_t timers_before = liveTimersOnStopperNode();
+
+    robot_->publishTaskRunning(false);
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains("deactivate"); }, 10s)) << "controllers were never deactivated";
+
+    EXPECT_TRUE(spinUntil([this, timers_before]() { return liveTimersOnStopperNode() == timers_before; }, 2s))
+        << "a finished stop kept its canceled timeout timer alive: " << liveTimersOnStopperNode() << " timers, expected "
+        << timers_before;
+}
+
 TEST_F(ControllerStopperTest, DeactivatesAfterTheTimeoutWhenTheCancelIsNeverAnswered) {
     FakeRobotConfig config;
     config.controllers = {{TRAJECTORY_CONTROLLER, true}, {NO_ACTION_CONTROLLER, false}, {CONSISTENT_CONTROLLER, false}};
@@ -654,8 +829,17 @@ TEST_F(ControllerStopperTest, AttachesNoEndpointsToAControllerWithoutATrajectory
     waitForPrimeTick();
     spinFor(1s);
 
+    const auto stopper_status_subscriptions = [this](const std::string& controller) {
+        const auto infos =
+            robot_->node()->get_subscriptions_info_by_topic("/" + controller + "/follow_joint_trajectory/_action/status");
+        return static_cast<std::size_t>(std::count_if(
+            infos.begin(), infos.end(), [](const auto& info) { return info.node_name() == "controller_stopper_under_test"; }));
+    };
+    EXPECT_EQ(stopper_status_subscriptions(TRAJECTORY_CONTROLLER), 1u)
+        << "the stopper never subscribed to the trajectory controller's goal status";
+    EXPECT_EQ(stopper_status_subscriptions(NO_ACTION_CONTROLLER), 0u)
+        << "a status subscription with no publisher is a dangling graph endpoint";
     const auto services = robot_->node()->get_service_names_and_types();
-    EXPECT_EQ(services.count("/" + std::string(TRAJECTORY_CONTROLLER) + "/follow_joint_trajectory/_action/cancel_goal"), 1u);
     EXPECT_EQ(services.count("/" + std::string(NO_ACTION_CONTROLLER) + "/follow_joint_trajectory/_action/cancel_goal"), 0u)
         << "a cancel client with no server is a dangling graph endpoint";
 }

@@ -34,6 +34,7 @@
   <depend>pluginlib</depend>
   <depend>controller_manager_msgs</depend>
   <depend>action_msgs</depend>
+  <depend>unique_identifier_msgs</depend>
   <depend>controller_manager</depend>
   <depend>realtime_tools</depend>
   <depend>launch</depend>

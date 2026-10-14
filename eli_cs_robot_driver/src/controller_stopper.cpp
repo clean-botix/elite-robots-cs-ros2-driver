@@ -3,9 +3,9 @@
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
+#include <action_msgs/msg/goal_status.hpp>
 #include <action_msgs/srv/cancel_goal.hpp>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/utilities.hpp>
@@ -126,10 +126,11 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
 
 ControllerStopper::~ControllerStopper() {
     prime_timer_->cancel();
-    for (auto& timer : cancel_timeout_timers_) {
-        timer->cancel();
+    for (auto& pending : pending_cancels_) {
+        pending->timeout->cancel();
     }
     robot_running_sub_.reset();
+    trajectory_status_subs_.clear();
     controller_list_srv_->prune_pending_requests();
     controller_manager_srv_->prune_pending_requests();
     for (auto& [name, client] : trajectory_cancel_clients_) {
@@ -200,88 +201,124 @@ void ControllerStopper::findAndStopControllers() {
 }
 
 void ControllerStopper::cancelTrajectoryGoals(const std::vector<std::string>& controllers, std::function<void()> on_canceled) {
-    using CancelGoal = action_msgs::srv::CancelGoal;
-
+    auto pending = std::make_shared<PendingCancel>();
     // A client created now would not discover its server in time
-    std::vector<std::pair<std::string, rclcpp::Client<CancelGoal>::SharedPtr>> to_cancel;
     for (const auto& controller : controllers) {
         auto it = trajectory_cancel_clients_.find(controller);
         if (it == trajectory_cancel_clients_.end()) {
             RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
                         "'%s' has no trajectory action server; deactivating it without a cancel", controller.c_str());
         } else if (it->second->service_is_ready()) {
-            to_cancel.emplace_back(controller, it->second);
+            pending->controllers.insert(controller);
         } else {
             RCLCPP_WARN(rclcpp::get_logger("Controller stopper"),
                         "Trajectory action server for '%s' has gone away; deactivating it without a cancel", controller.c_str());
         }
     }
 
-    if (to_cancel.empty()) {
+    if (pending->controllers.empty()) {
         on_canceled();
         return;
     }
 
     RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "Canceling trajectory goals on %zu controller(s) before deactivating",
-                to_cancel.size());
+                pending->controllers.size());
 
-    // on_canceled runs once. It runs after the last answer or after the timeout.
-    struct PendingCancel {
-        std::set<std::string> unanswered;
-        std::function<void()> on_canceled;
-        rclcpp::TimerBase::WeakPtr timeout;
-        bool finished = false;
-    };
-    auto pending = std::make_shared<PendingCancel>();
     pending->on_canceled = std::move(on_canceled);
-    for (const auto& entry : to_cancel) {
-        pending->unanswered.insert(entry.first);
-    }
-
-    auto finish = [this, pending]() {
+    pending->timeout = node_->create_wall_timer(cancel_timeout_, [this, pending]() {
         if (pending->finished) {
             return;
         }
-        pending->finished = true;
-        if (auto timer = pending->timeout.lock()) {
-            timer->cancel();
-            cancel_timeout_timers_.erase(std::remove(cancel_timeout_timers_.begin(), cancel_timeout_timers_.end(), timer),
-                                         cancel_timeout_timers_.end());
-        }
-        pending->on_canceled();
-    };
-
-    auto timer = node_->create_wall_timer(cancel_timeout_, [pending, finish]() {
-        if (pending->finished) {
-            return;
-        }
-        RCLCPP_WARN(rclcpp::get_logger("Controller stopper"), "Trajectory cancel got no answer from [%s] within the timeout",
-                    joinNames({pending->unanswered.begin(), pending->unanswered.end()}).c_str());
-        finish();
+        RCLCPP_WARN(rclcpp::get_logger("Controller stopper"), "Trajectory goals on [%s] did not end within the timeout",
+                    joinNames(stillWaitingOn(*pending)).c_str());
+        finishCancel(pending);
     });
-    pending->timeout = timer;
-    cancel_timeout_timers_.push_back(timer);
-
-    // A zero goal ID and a zero stamp cancel every goal
-    auto cancel_all = std::make_shared<CancelGoal::Request>();
-    for (const auto& [controller, client] : to_cancel) {
-        client->async_send_request(
-            cancel_all, [pending, finish, controller = controller](rclcpp::Client<CancelGoal>::SharedFuture future) {
-                const auto response = future.get();
-                if (response->return_code == CancelGoal::Response::ERROR_REJECTED) {
-                    // REJECTED means no goal or a refusal. A refusal surfaces as a failed deactivate.
-                    RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
-                                "Trajectory cancel for '%s' canceled nothing (no goal, or refused)", controller.c_str());
-                } else if (response->return_code != CancelGoal::Response::ERROR_NONE) {
-                    RCLCPP_WARN(rclcpp::get_logger("Controller stopper"), "Trajectory cancel for '%s' answered with return code %d",
-                                controller.c_str(), response->return_code);
-                }
-                pending->unanswered.erase(controller);
-                if (pending->unanswered.empty()) {
-                    finish();
-                }
-            });
+    pending_cancels_.push_back(pending);
+    for (const auto& controller : pending->controllers) {
+        sendCancel(pending, controller);
     }
+}
+
+void ControllerStopper::sendCancel(const std::shared_ptr<PendingCancel>& pending, const std::string& controller) {
+    using CancelGoal = action_msgs::srv::CancelGoal;
+    pending->unanswered.insert(controller);
+    // A zero goal ID and a zero stamp cancel every goal
+    auto& client = trajectory_cancel_clients_.at(controller);
+    client->async_send_request(
+        std::make_shared<CancelGoal::Request>(), [this, pending, controller](rclcpp::Client<CancelGoal>::SharedFuture future) {
+            const auto response = future.get();
+            if (response->return_code == CancelGoal::Response::ERROR_REJECTED) {
+                // REJECTED means no goal or a refusal. A refusal surfaces as a failed deactivate.
+                RCLCPP_INFO(rclcpp::get_logger("Controller stopper"),
+                            "Trajectory cancel for '%s' canceled nothing (no goal, or refused)", controller.c_str());
+            } else if (response->return_code != CancelGoal::Response::ERROR_NONE) {
+                RCLCPP_WARN(rclcpp::get_logger("Controller stopper"), "Trajectory cancel for '%s' answered with return code %d",
+                            controller.c_str(), response->return_code);
+            }
+            // Accumulate: a goal still ending from an earlier answer is not a new one
+            for (const auto& goal : response->goals_canceling) {
+                pending->canceling[controller].insert(goal.goal_id.uuid);
+            }
+            pending->unanswered.erase(controller);
+            settlePendingCancel(pending);
+        });
+}
+
+void ControllerStopper::settlePendingCancel(const std::shared_ptr<PendingCancel>& pending) {
+    if (pending->finished) {
+        return;
+    }
+    for (const auto& controller : pending->controllers) {
+        if (pending->unanswered.count(controller) > 0) {
+            continue;
+        }
+        const auto& covered = pending->canceling[controller];
+        for (const auto& goal : liveGoals(controller)) {
+            if (covered.count(goal) == 0) {
+                // The sender answered the cancel with its next goal. It must not outlive the deactivate.
+                RCLCPP_WARN(rclcpp::get_logger("Controller stopper"),
+                            "'%s' accepted a new trajectory goal after the cancel; canceling again", controller.c_str());
+                sendCancel(pending, controller);
+                break;
+            }
+        }
+    }
+    if (stillWaitingOn(*pending).empty()) {
+        finishCancel(pending);
+    }
+}
+
+void ControllerStopper::finishCancel(const std::shared_ptr<PendingCancel>& pending) {
+    pending->finished = true;
+    pending->timeout->cancel();
+    // The timer's callback holds `pending`; dropping the timer breaks the cycle so both are freed
+    pending->timeout.reset();
+    pending_cancels_.erase(std::remove(pending_cancels_.begin(), pending_cancels_.end(), pending), pending_cancels_.end());
+    pending->on_canceled();
+}
+
+std::vector<std::string> ControllerStopper::stillWaitingOn(const PendingCancel& pending) const {
+    std::vector<std::string> waiting;
+    for (const auto& controller : pending.controllers) {
+        if (pending.unanswered.count(controller) > 0 || !liveGoals(controller).empty()) {
+            waiting.push_back(controller);
+        }
+    }
+    return waiting;
+}
+
+std::set<ControllerStopper::GoalId> ControllerStopper::liveGoals(const std::string& controller) const {
+    std::set<GoalId> live;
+    auto it = trajectory_goal_status_.find(controller);
+    if (it == trajectory_goal_status_.end()) {
+        return live;
+    }
+    for (const auto& status : it->second->status_list) {
+        if (status.status < action_msgs::msg::GoalStatus::STATUS_SUCCEEDED) {
+            live.insert(status.goal_info.goal_id.uuid);
+        }
+    }
+    return live;
 }
 
 void ControllerStopper::primeTrajectoryActionClients() {
@@ -296,14 +333,26 @@ void ControllerStopper::primeTrajectoryActionClients() {
                 if (trajectory_cancel_clients_.count(controller.name) > 0 || isConsistent(controller.name)) {
                     continue;
                 }
-                const std::string cancel_service = node_->get_node_base_interface()->resolve_topic_or_service_name(
-                    controller.name + "/follow_joint_trajectory/_action/cancel_goal", true);
-                // A client for a service that does not exist is a dangling graph endpoint, and
-                // MoveIt Pro's web bridge throws on those
+                const std::string action = controller.name + "/follow_joint_trajectory/_action/";
+                // A client or subscription for an action that does not exist is a dangling graph
+                // endpoint, and MoveIt Pro's web bridge throws on those
+                const std::string cancel_service =
+                    node_->get_node_base_interface()->resolve_topic_or_service_name(action + "cancel_goal", true);
                 if (services.count(cancel_service) == 0) {
                     continue;
                 }
-                trajectory_cancel_clients_.emplace(controller.name, node_->create_client<action_msgs::srv::CancelGoal>(cancel_service));
+                trajectory_cancel_clients_.emplace(controller.name,
+                                                   node_->create_client<action_msgs::srv::CancelGoal>(action + "cancel_goal"));
+                // Matches the action status publisher: reliable, transient local, latest only
+                trajectory_status_subs_.emplace(
+                    controller.name, node_->create_subscription<action_msgs::msg::GoalStatusArray>(
+                                         action + "status", rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local(),
+                                         [this, name = controller.name](action_msgs::msg::GoalStatusArray::ConstSharedPtr msg) {
+                                             trajectory_goal_status_[name] = std::move(msg);
+                                             for (const auto& pending : std::vector(pending_cancels_)) {
+                                                 settlePendingCancel(pending);
+                                             }
+                                         }));
                 ++added;
             }
             if (added > 0) {

@@ -19,6 +19,7 @@ find_package(tf2_geometry_msgs REQUIRED)
 find_package(controller_manager REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
 find_package(action_msgs REQUIRED)
+find_package(unique_identifier_msgs REQUIRED)
 find_package(backward_ros REQUIRED)
 find_package(elite-cs-series-sdk REQUIRED)
 find_package(realtime_tools REQUIRED)
@@ -35,6 +36,7 @@ set(
   rclcpp 
   rclcpp_components
   action_msgs
+  unique_identifier_msgs
   controller_manager_msgs
 )
 
@@ -263,6 +265,7 @@ if(BUILD_TESTING)
     rclcpp
     rclcpp_action
     action_msgs
+    unique_identifier_msgs
     control_msgs
     controller_manager_msgs
     eli_common_interface
