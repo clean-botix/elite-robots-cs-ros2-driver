@@ -21,7 +21,10 @@ class ControllerStopper {
    public:
     ControllerStopper() = delete;
     ControllerStopper(const rclcpp::Node::SharedPtr& node, bool stop_controllers_on_startup);
-    virtual ~ControllerStopper() = default;
+    /*!
+     * \brief Cancels every timer and pending request that calls back into this object.
+     */
+    virtual ~ControllerStopper();
 
    private:
     void robotRunningCallback(const std_msgs::msg::Bool::ConstSharedPtr msg);

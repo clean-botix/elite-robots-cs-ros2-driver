@@ -594,6 +594,35 @@ TEST_F(ControllerStopperTest, DeactivatesWithoutACancelWhenNoControllerHasATraje
     EXPECT_FALSE(robot_->isActive(NO_ACTION_CONTROLLER));
 }
 
+TEST_F(ControllerStopperTest, StopsPollingTheControllerManagerOnceDestroyed) {
+    start();
+    spinFor(2500ms);
+    ASSERT_GT(robot_->listRequests(), 1) << "the prime timer never fired; this test proves nothing";
+
+    stopper_.reset();
+    const int requests_at_destruction = robot_->listRequests();
+    spinFor(4500ms);
+
+    EXPECT_EQ(robot_->listRequests(), requests_at_destruction)
+        << "the prime timer outlived the stopper and called back into a destroyed object";
+}
+
+TEST_F(ControllerStopperTest, DoesNotDeactivateAfterDestructionWhileACancelIsPending) {
+    FakeRobotConfig config;
+    config.cancel_mode = CancelMode::NEVER_ANSWER;
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+    robot_->publishTaskRunning(false);
+    ASSERT_TRUE(spinUntil([this]() { return log_.contains(cancelEvent(TRAJECTORY_CONTROLLER)); }, 10s))
+        << "the cancel was never sent";
+
+    stopper_.reset();
+    robot_->releaseCancels();
+    spinFor(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(CANCEL_TIMEOUT_S * 3)));
+
+    EXPECT_FALSE(log_.contains("deactivate")) << "the cancel timeout or its answer called back into the destroyed stopper";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {

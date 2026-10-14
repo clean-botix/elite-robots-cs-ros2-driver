@@ -123,6 +123,19 @@ ControllerStopper::ControllerStopper(const rclcpp::Node::SharedPtr& node, bool s
     }
 }
 
+ControllerStopper::~ControllerStopper() {
+    prime_timer_->cancel();
+    for (auto& timer : cancel_timeout_timers_) {
+        timer->cancel();
+    }
+    robot_running_sub_.reset();
+    controller_list_srv_->prune_pending_requests();
+    controller_manager_srv_->prune_pending_requests();
+    for (auto& [name, client] : trajectory_cancel_clients_) {
+        client->prune_pending_requests();
+    }
+}
+
 bool ControllerStopper::isConsistent(const std::string& controller) const {
     return std::find(consistent_controllers_.begin(), consistent_controllers_.end(), controller) != consistent_controllers_.end();
 }
