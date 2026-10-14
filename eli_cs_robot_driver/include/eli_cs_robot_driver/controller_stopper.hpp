@@ -3,10 +3,14 @@
 
 #include "eli_common_interface/srv/get_robot_mode.hpp"
 
+#include <functional>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
+#include <action_msgs/srv/cancel_goal.hpp>
 #include <controller_manager_msgs/srv/list_controllers.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -31,10 +35,34 @@ class ControllerStopper {
     void findAndStopControllers();
 
     /*!
+     * \brief Cancels the trajectory goals of the controllers about to stop, then runs `on_canceled`.
+     *
+     * PickNik's joint_trajectory_admittance_controller refuses to deactivate while it holds a goal.
+     * The goal then reports success for a motion the robot abandoned. This cancels goals another
+     * node sent. Normal ROS 2 action usage does not do that.
+     *
+     * The cancel goes to the action's cancel service, which has one type for every action. The
+     * admittance controller serves FollowJointTrajectoryWithAdmittance under the same name.
+     */
+    void cancelTrajectoryGoals(const std::vector<std::string>& controllers, std::function<void()> on_canceled);
+
+    /*!
+     * \brief Creates a cancel client for each trajectory action in the graph that has none yet.
+     *
+     * A client created at the stop has not discovered its server in time. The spawners load the
+     * controllers after this node starts. A timer therefore repeats the prime.
+     */
+    void primeTrajectoryActionClients();
+
+    bool isConsistent(const std::string& controller) const;
+
+    /*!
      * \brief Starts the controllers stored in stopped_controllers_.
      *
      */
     void startControllers();
+
+    rclcpp::TimerBase::SharedPtr prime_timer_;
 
     std::shared_ptr<rclcpp::Node> node_;
     rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr controller_manager_srv_;
@@ -42,6 +70,8 @@ class ControllerStopper {
     rclcpp::Client<eli_common_interface::srv::GetRobotMode>::SharedPtr dashboard_robot_mode_srv_;
 
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr robot_running_sub_;
+
+    std::map<std::string, rclcpp::Client<action_msgs::srv::CancelGoal>::SharedPtr> trajectory_cancel_clients_;
 
     std::vector<std::string> consistent_controllers_;
     std::vector<std::string> stopped_controllers_;
