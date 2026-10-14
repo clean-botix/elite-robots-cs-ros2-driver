@@ -522,6 +522,23 @@ TEST_F(ControllerStopperTest, RestartsTheControllersOnEveryStopStartCycle) {
     EXPECT_EQ(log_.count("activate"), 2u);
 }
 
+TEST_F(ControllerStopperTest, RestartsTheControllersThatStoppedWhenOneKeptItsGoal) {
+    FakeRobotConfig config;
+    config.controllers = {{TRAJECTORY_CONTROLLER, true}, {NO_ACTION_CONTROLLER, false}, {CONSISTENT_CONTROLLER, false}};
+    config.cancel_mode = CancelMode::REJECT;
+    start(config);
+    sendTrajectoryGoal(TRAJECTORY_CONTROLLER);
+    robot_->publishTaskRunning(false);
+    ASSERT_TRUE(spinUntil([this]() { return !robot_->isActive(NO_ACTION_CONTROLLER); }, 10s))
+        << "controllers were never deactivated";
+    ASSERT_TRUE(robot_->isActive(TRAJECTORY_CONTROLLER)) << "the controller gave up a goal it was meant to keep";
+
+    robot_->publishTaskRunning(true);
+
+    EXPECT_TRUE(spinUntil([this]() { return robot_->isActive(NO_ACTION_CONTROLLER); }, 10s))
+        << "the controller that did stop was never restarted";
+}
+
 TEST_F(ControllerStopperTest, DeactivatesAControllerThePrimeHasNotSeenWithoutACancel) {
     FakeRobotConfig config;
     config.controllers_loaded = false;
@@ -594,6 +611,7 @@ TEST_F(ControllerStopperTest, DeactivatesAfterTheTimeoutWhenTheCancelIsNeverAnsw
     EXPECT_TRUE(log_.contains(cancelEvent(TRAJECTORY_CONTROLLER))) << "the cancel was never sent";
     EXPECT_GE(waited, std::chrono::duration<double>(CANCEL_TIMEOUT_S * 0.9))
         << "the deactivate did not wait for the cancel it was meant to wait for";
+    EXPECT_FALSE(robot_->isActive(NO_ACTION_CONTROLLER)) << "the controller holding a goal kept the others running";
     EXPECT_EQ(log_.count("deactivate"), 1u);
 }
 

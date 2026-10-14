@@ -178,7 +178,8 @@ void ControllerStopper::findAndStopControllers() {
             if (stopped_controllers_.empty()) {
                 return;
             }
-            request_switch_controller->strictness = request_switch_controller->STRICT;
+            // A controller that keeps its goal stays active. BEST_EFFORT still stops the rest.
+            request_switch_controller->strictness = request_switch_controller->BEST_EFFORT;
             request_switch_controller->deactivate_controllers = stopped_controllers_;
             cancelTrajectoryGoals(
                 stopped_controllers_, [this, generation, request_switch_controller, callback_switch_controller]() {
@@ -321,7 +322,8 @@ void ControllerStopper::startControllers() {
         return;
     }
     auto request = std::make_shared<controller_manager_msgs::srv::SwitchController::Request>();
-    request->strictness = request->STRICT;
+    // A controller that kept its goal is still active. STRICT would refuse the whole activate.
+    request->strictness = request->BEST_EFFORT;
     request->activate_controllers = stopped_controllers_;
     RCLCPP_INFO(rclcpp::get_logger("Controller stopper"), "Restarting [%s]", joinNames(stopped_controllers_).c_str());
     auto callback = [request](rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedFuture future_response) {
