@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - feature/moveit_pro
+  # Lets a maintainer start the sync by hand.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,7 +17,7 @@ permissions:
 
 jobs:
   sync-deps:
-    uses: getdevopspro/github-actions/.github/workflows/pr-create.yml@v12.0.3
+    uses: getdevopspro/github-actions/.github/workflows/pr-create.yml@v13.0.0
     secrets:
       token: ${{ secrets.BOT_REPO_TOKEN }}
       ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -24,7 +26,7 @@ jobs:
       ref: main
       lfs: true
       just-install: true
-      command: just deps-sync
+      command: just ci-deps-sync
       branch: create-pull-request/sync-deps-from-elite-driver-repo
       # moveit allows only merge commits; the shared default is squash.
       merge-method: merge
