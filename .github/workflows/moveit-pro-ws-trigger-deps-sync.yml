@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - feature/moveit_pro
+  # Lets a maintainer start the sync by hand.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
