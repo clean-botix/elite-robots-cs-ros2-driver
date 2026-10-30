@@ -18,8 +18,6 @@ find_package(rclcpp_lifecycle REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(controller_manager REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
-find_package(action_msgs REQUIRED)
-find_package(unique_identifier_msgs REQUIRED)
 find_package(backward_ros REQUIRED)
 find_package(elite-cs-series-sdk REQUIRED)
 find_package(realtime_tools REQUIRED)
@@ -35,8 +33,6 @@ set(
   std_srvs
   rclcpp 
   rclcpp_components
-  action_msgs
-  unique_identifier_msgs
   controller_manager_msgs
 )
 
@@ -254,23 +250,6 @@ if(BUILD_TESTING)
   # concurrent writer) and the reporter summary line.
   ament_add_gtest(test_rt_timebase test/test_rt_timebase.cpp src/rt_timebase.cpp)
   target_include_directories(test_rt_timebase PRIVATE include)
-
-  # ControllerStopper cancels trajectory goals before it deactivates controllers.
-  find_package(control_msgs REQUIRED)
-  find_package(rclcpp_action REQUIRED)
-  ament_add_gtest(test_controller_stopper test/test_controller_stopper.cpp src/controller_stopper.cpp)
-  target_include_directories(test_controller_stopper PRIVATE include)
-  ament_target_dependencies(
-    test_controller_stopper
-    rclcpp
-    rclcpp_action
-    action_msgs
-    unique_identifier_msgs
-    control_msgs
-    controller_manager_msgs
-    eli_common_interface
-    std_srvs
-  )
 
   # Regression test for elite_control.launch.py's bool-typed launch parameters.
   find_package(ament_cmake_pytest REQUIRED)
