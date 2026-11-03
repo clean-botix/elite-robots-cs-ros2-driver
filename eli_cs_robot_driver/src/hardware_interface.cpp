@@ -705,6 +705,11 @@ bool EliteCSPositionHardwareInterface::reconnectAll() {
                 reconnect_log_time_ = now;
             }
         } else {
+            // In headless mode connect() resent the external control script, so the
+            // command buffers may hold a pre-interruption target. Reset them as the
+            // resend path does. write() applies the reset on the first cycle with a fresh
+            // RTSI frame, well before the script connects back and takes a servoj target.
+            command_reset_pending_.store(true);
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                 "reconnectAll: EliteDriver control channel reconnected");
         }
@@ -771,6 +776,7 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
     (void)period;
     (void)time;
     bool recv_ok = false;
+    joint_positions_fresh_ = false;
     if (!rtsi_reconnecting_.load() && rtsi_interface_) {
         try {
             recv_ok = rtsi_interface_->receiveData(rtsi_out_recipe_, true);
@@ -834,6 +840,7 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
         reconnect_failed_.store(false);
     }
     rtsi_out_recipe_->getValue("actual_joint_positions", joint_positions_);
+    joint_positions_fresh_ = true;
     rtsi_out_recipe_->getValue("actual_joint_speeds", joint_velocities_);
     rtsi_out_recipe_->getValue("actual_joint_current", joint_efforts_);
     rtsi_out_recipe_->getValue("speed_scaling", speed_scaling_combined_);
@@ -1034,11 +1041,13 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
 hardware_interface::return_type EliteCSPositionHardwareInterface::write(const rclcpp::Time& time, const rclcpp::Duration& period) {
     (void)time;
     (void)period;
-    // updateAsyncIO() (async_thread_) flags a pending reset right before resending the
-    // external control script. Consume it here, on the realtime thread, so the actual
-    // write to position_commands_/velocity_commands_ never races with this function's own
-    // read of them a few lines below.
-    if (command_reset_pending_.exchange(false)) {
+    // async_thread_ flags a pending reset whenever it resends the external control script.
+    // Consume it here, on the realtime thread, so the actual write to position_commands_/
+    // velocity_commands_ never races with this function's own read of them a few lines
+    // below. The reset waits for a cycle whose read() got a fresh RTSI frame, so it never
+    // holds a pose from before an RTSI dropout. The script needs about a second to connect
+    // back, so waiting a cycle or two delays nothing.
+    if (joint_positions_fresh_ && command_reset_pending_.exchange(false)) {
         resetCommandsToActualPose();
     }
     // If there is no interpreting task running on the robot, we do not want to send anything.
