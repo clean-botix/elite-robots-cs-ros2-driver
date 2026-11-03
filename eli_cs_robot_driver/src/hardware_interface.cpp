@@ -384,6 +384,20 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
     // Time of servoj run
     const double servoj_time = stod(info_.hardware_parameters["servoj_time"]);
 
+    // Tool voltage applied each time the task starts. Only ToolVoltage values qualify.
+    configured_tool_voltage_ = -1;
+    if (info_.hardware_parameters.count("tool_voltage")) {
+        const int tool_voltage = stoi(info_.hardware_parameters["tool_voltage"]);
+        if (tool_voltage == static_cast<int>(ELITE::ToolVoltage::OFF) ||
+            tool_voltage == static_cast<int>(ELITE::ToolVoltage::V_12) ||
+            tool_voltage == static_cast<int>(ELITE::ToolVoltage::V_24)) {
+            configured_tool_voltage_ = tool_voltage;
+        } else {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "tool_voltage=%d is not 0, 12, or 24 — it will not be applied", tool_voltage);
+        }
+    }
+
     // const bool use_tool_communication = (info_.hardware_parameters["use_tool_communication"] == "true") ||
     //                                     (info_.hardware_parameters["use_tool_communication"] == "True");
 
@@ -904,6 +918,10 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                 "EliteScript task is now EXECUTING");
         }
+        // Every task start, the first included, gets the configured tool voltage.
+        if (runtime_state_ == ELITE::TaskStatus::PLAYING && configured_tool_voltage_ >= 0) {
+            tool_voltage_apply_pending_.store(true);
+        }
         prev_runtime_state_ = runtime_state_;
     }
 
@@ -1280,6 +1298,18 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
                 RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                     "Initial external control script send failed — will retry when arm is ready");
             }
+        }
+    }
+
+    // Apply the configured tool voltage after each task start. setToolVoltage() fails
+    // until the script connects its command socket, so this retries every cycle until
+    // it lands. It runs before updateToolVoltage(), so a same-cycle command still wins.
+    if (tool_voltage_apply_pending_.load() && eli_driver_ != nullptr &&
+        runtime_state_ == ELITE::TaskStatus::PLAYING) {
+        if (eli_driver_->setToolVoltage(static_cast<ELITE::ToolVoltage>(configured_tool_voltage_))) {
+            tool_voltage_apply_pending_.store(false);
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "Applied configured tool_voltage=%d V at task start", configured_tool_voltage_);
         }
     }
 

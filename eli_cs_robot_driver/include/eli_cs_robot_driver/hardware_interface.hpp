@@ -210,6 +210,11 @@ protected:
     std::array<double, STANARD_ANALOG_IO_NUM> standard_analog_output_cmd_;
     std::array<double, STANARD_ANALOG_IO_NUM> standard_analog_output_types_cmd_;
     double tool_voltage_cmd_;
+    // The tool_voltage hardware parameter. -1 means none, or an unsupported value.
+    int configured_tool_voltage_{ -1 };
+    // Set by read() each time the task starts. Cleared by updateAsyncIO() once the
+    // script accepts the configured voltage.
+    std::atomic<bool> tool_voltage_apply_pending_{ false };
     double zero_ftsensor_cmd_;
     double zero_ftsensor_async_success_;
 

@@ -46,7 +46,7 @@ Temporarily unavailable.
 Specify lookahead_time parameter of underlying servoj command. This will be used whenever position control is active. A higher value will result in smoother trajectories, but will also introduce a higher delay between the commands sent from ROS and the motion being executed on the robot. Unit: seconds. Range: [0.03 - 0.2]
 
 #### *tool_voltage*
-Tool voltage that will be set as soon as the task on the robot is started.
+Tool voltage that will be set as soon as the task on the robot is started. The driver applies it again after every task restart. Unit: volts. Accepted values: 0, 12, 24. Any other value is logged and ignored.
 
 ## dashboard_client
 
