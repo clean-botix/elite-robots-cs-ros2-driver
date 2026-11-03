@@ -45,6 +45,12 @@ Temporarily unavailable.
 #### *servoj_lookahead_time*
 Specify lookahead_time parameter of underlying servoj command. This will be used whenever position control is active. A higher value will result in smoother trajectories, but will also introduce a higher delay between the commands sent from ROS and the motion being executed on the robot. Unit: seconds. Range: [0.03 - 0.2]
 
+#### *servoj_start_delta_limit*
+Largest allowed gap between the first servoj target of a servo session and the arm's actual position, per joint. A larger gap makes the external control script refuse the target, show a popup, and halt. Unit: radians. Default: 0.0872665 (5 degrees).
+
+#### *payload_mass_max*
+Largest payload mass the external control script accepts. The script refuses a larger mass and logs the refusal. Unit: kilograms. Default: 14.4.
+
 #### *tool_voltage*
 Tool voltage that will be set as soon as the task on the robot is started. The driver applies it again after every task restart. Unit: volts. Accepted values: 0, 12, 24. Any other value is logged and ignored.
 

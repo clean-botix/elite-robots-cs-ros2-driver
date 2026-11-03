@@ -32,6 +32,15 @@ MODE_TOOL_IN_CONTACT = 7
 
 STOPJ_ACCELERATION = {{STOP_J_REPLACE}}
 
+# Radians. The first servoj target of a servo session is refused if any joint
+# lies farther than this from the arm's actual position. The host starts each
+# servo session from the arm's measured state. A large gap therefore means a
+# stale or corrupt command. The driver supplies this value.
+SERVOJ_START_DELTA_LIMIT = {{SERVOJ_START_DELTA_LIMIT_REPLACE}}
+
+# Kilograms. A payload mass above this value is refused. The driver supplies this value.
+PAYLOAD_MASS_MAX = {{PAYLOAD_MASS_MAX_REPLACE}}
+
 SCRIPT_CMD_ZERO_FTSENSOR = 0
 SCRIPT_CMD_SET_PAYLOAD = 1
 SCRIPT_CMD_SET_TOOL_VOLTAGE = 2
@@ -57,6 +66,7 @@ global cmd_speed_joint
 global steptime
 global trajectory_point_num
 global cmd_servo_joints
+global servo_start_check_pending
 
 textmsg("ExternalControl: Script started")
 
@@ -93,8 +103,32 @@ def setServoSetpoint(joints):
     with SERVOJ_DATA_MUTEX:
         cmd_servo_joints = joints
 
+# Vets the first servoj target of a servo session against the arm's actual
+# position. A target within SERVOJ_START_DELTA_LIMIT on every joint clears
+# servo_start_check_pending. A farther target logs, raises a popup, and halts
+# the script. The check is independent of anything on the host side. Later
+# targets in the session follow the host's own smooth trajectory and skip it.
+# abs() is unconfirmed on the robot interpreter, so a manual sign flip stands in.
+def verifyServoStartSetpoint(target_joints):
+    global servo_start_check_pending
+    actual_joints = get_actual_joint_positions()
+    fault_msg = ""
+    i = 0
+    while i < 6:
+        delta = target_joints[i] - actual_joints[i]
+        if delta < 0:
+            delta = 0 - delta
+        if delta > SERVOJ_START_DELTA_LIMIT and fault_msg == "":
+            fault_msg = "ExternalControl: servoj start target refused on joint " + str(i) + " | delta=" + str(delta) + " | limit=" + str(SERVOJ_START_DELTA_LIMIT) + " | target=" + str(target_joints[i]) + " | actual=" + str(actual_joints[i])
+        i += 1
+    if fault_msg == "":
+        servo_start_check_pending = False
+    else:
+        textmsg(fault_msg)
+        popup(fault_msg, title="External Control Safety Fault", error=True, blocking=False)
+        halt()
+
 def runServoIteration():
-    joints = get_actual_joint_positions()
     with SERVOJ_DATA_MUTEX:
         joints = cmd_servo_joints
     servoj(joints, {{SERVO_J_REPLACE}})
@@ -158,13 +192,15 @@ def runScriptCommandIteration():
             mass = raw_command[2] / COMMON_ZOOM_RATIO
             cog = [raw_command[3] / COMMON_ZOOM_RATIO, raw_command[4] / COMMON_ZOOM_RATIO, raw_command[5] / COMMON_ZOOM_RATIO]
             # Ensure message bytes evaluate to valid payload
-            if mass >= 0.0 and mass <= 14.4:
-                mass_str = 'mass: ' + str(mass)
-                cog_str = 'CoG: ' + str(cog)
-                payload_str = mass_str + ' | ' + cog_str
-                # Updates with textmsg() can go missing if successive calls, so make it a single log string
-                textmsg("Set payload:: ", payload_str)
+            mass_str = 'mass: ' + str(mass)
+            cog_str = 'CoG: ' + str(cog)
+            payload_str = mass_str + ' | ' + cog_str
+            # Successive textmsg() calls can drop messages, so each log is a single string
+            if mass >= 0.0 and mass <= PAYLOAD_MASS_MAX:
+                textmsg("Set payload: " + payload_str)
                 set_payload(mass, cog)
+            else:
+                textmsg("ExternalControl: payload refused | " + payload_str + " | limit=" + str(PAYLOAD_MASS_MAX))
         elif command == SCRIPT_CMD_SET_TOOL_VOLTAGE:
             tool_voltage = raw_command[2] / COMMON_ZOOM_RATIO
             tool_voltage = int(tool_voltage)
@@ -202,6 +238,7 @@ def initializeControlState():
     global steptime
     global trajectory_point_num
     global cmd_servo_joints
+    global servo_start_check_pending
     global script_command_thread_handle
     global move_thread_handle
     global trajectory_thread_handle
@@ -212,6 +249,7 @@ def initializeControlState():
     steptime = get_steptime()
     trajectory_point_num = 0
     cmd_servo_joints = get_actual_joint_positions()
+    servo_start_check_pending = False
     script_command_thread_handle = start_thread(scriptCommands, ())
     move_thread_handle = 0
     trajectory_thread_handle = 0
@@ -232,6 +270,7 @@ def handleControlModeSwitch(new_mode):
     global move_thread_handle
     global trajectory_thread_handle
     global cmd_servo_joints
+    global servo_start_check_pending
     # Clear remaining trajectory points
     if control_mode == MODE_TRAJECTORY:
         stop_thread(trajectory_thread_handle)
@@ -260,6 +299,7 @@ def handleControlModeSwitch(new_mode):
         move_thread_handle = start_thread(speedjThread, ())
     elif control_mode == MODE_SERVOJ:
         cmd_servo_joints = get_actual_joint_positions()
+        servo_start_check_pending = True
         move_thread_handle = start_thread(servoThread, ())
 
     # Log when a script stop is commanded externally
@@ -272,7 +312,11 @@ def applyModeCommand(params_mult):
     # Update the motion commands with new parameters
     if control_mode == MODE_SERVOJ:
         joints = [params_mult[2]/ POS_ZOOM_RATIO, params_mult[3]/ POS_ZOOM_RATIO, params_mult[4]/ POS_ZOOM_RATIO, params_mult[5]/ POS_ZOOM_RATIO, params_mult[6]/ POS_ZOOM_RATIO, params_mult[7]/ POS_ZOOM_RATIO]
-        setServoSetpoint(joints)
+        # A refused start target never reaches cmd_servo_joints, so the arm keeps holding
+        if servo_start_check_pending:
+            verifyServoStartSetpoint(joints)
+        if servo_start_check_pending == False:
+            setServoSetpoint(joints)
     elif control_mode == MODE_SPEEDL:
         setSpeedl([params_mult[2] / POS_ZOOM_RATIO, params_mult[3] / POS_ZOOM_RATIO, params_mult[4] / POS_ZOOM_RATIO, params_mult[5] / POS_ZOOM_RATIO, params_mult[6] / POS_ZOOM_RATIO, params_mult[7] / POS_ZOOM_RATIO])
     elif control_mode == MODE_SPEEDJ:

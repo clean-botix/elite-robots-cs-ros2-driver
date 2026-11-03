@@ -441,6 +441,16 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
         driver_config.servoj_time = servoj_time;
         driver_config.servoj_lookahead_time = servoj_lookahead_time;
         driver_config.servoj_gain = servoj_gain;
+        // Both limits are optional. An absent parameter keeps the SDK default.
+        if (info_.hardware_parameters.count("servoj_start_delta_limit")) {
+            driver_config.servoj_start_delta_limit = stod(info_.hardware_parameters["servoj_start_delta_limit"]);
+        }
+        if (info_.hardware_parameters.count("payload_mass_max")) {
+            driver_config.payload_mass_max = stod(info_.hardware_parameters["payload_mass_max"]);
+        }
+        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+            "Script limits: servoj_start_delta_limit=%.4f rad, payload_mass_max=%.2f kg",
+            driver_config.servoj_start_delta_limit, driver_config.payload_mass_max);
 
         eli_driver_ = std::make_unique<ELITE::EliteDriver>(driver_config);
 

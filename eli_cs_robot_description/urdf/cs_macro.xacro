@@ -57,6 +57,8 @@
     servoj_gain:=1000
     servoj_lookahead_time:=0.32
     servoj_time:=0.008
+    servoj_start_delta_limit:=0.0872665
+    payload_mass_max:=14.4
     script_filename:=to_be_filled_by_cs_robot_driver
     output_recipe_filename:=to_be_filled_by_cs_robot_driver
     input_recipe_filename:=to_be_filled_by_cs_robot_driver
@@ -99,6 +101,8 @@
         servoj_gain="${servoj_gain}"
         servoj_lookahead_time="${servoj_lookahead_time}"
         servoj_time="${servoj_time}"
+        servoj_start_delta_limit="${servoj_start_delta_limit}"
+        payload_mass_max="${payload_mass_max}"
         use_tool_communication="${use_tool_communication}"
         tool_voltage="${tool_voltage}"
         tool_parity="${tool_parity}"

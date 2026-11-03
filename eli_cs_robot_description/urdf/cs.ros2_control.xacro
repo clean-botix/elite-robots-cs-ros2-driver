@@ -20,6 +20,8 @@
     servoj_gain:=1000
     servoj_lookahead_time:=0.32
     servoj_time:=0.008
+    servoj_start_delta_limit:=0.0872665
+    payload_mass_max:=14.4
     tool_voltage:=0 
     tool_parity:=0
     tool_baud_rate:=115200
@@ -54,6 +56,8 @@
           <param name="servoj_gain">${servoj_gain}</param>
           <param name="servoj_lookahead_time">${servoj_lookahead_time}</param>
           <param name="servoj_time">${servoj_time}</param>
+          <param name="servoj_start_delta_limit">${servoj_start_delta_limit}</param>
+          <param name="payload_mass_max">${payload_mass_max}</param>
           <param name="script_filename">${script_filename}</param>
           <param name="output_recipe_filename">${output_recipe_filename}</param>
           <param name="input_recipe_filename">${input_recipe_filename}</param>

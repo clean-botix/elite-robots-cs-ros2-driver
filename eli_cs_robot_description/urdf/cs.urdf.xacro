@@ -30,6 +30,10 @@
    <xacro:arg name="servoj_gain" default="1000" />
    <xacro:arg name="servoj_lookahead_time" default="0.32" />
    <xacro:arg name="servoj_time" default="0.008" />
+   <!-- Radians. Five degrees by default. -->
+   <xacro:arg name="servoj_start_delta_limit" default="0.0872665" />
+   <!-- Kilograms. -->
+   <xacro:arg name="payload_mass_max" default="14.4" />
    <xacro:arg name="script_filename" default=""/>
    <xacro:arg name="output_recipe_filename" default=""/>
    <xacro:arg name="input_recipe_filename" default=""/>
@@ -99,6 +103,8 @@
      servoj_gain="$(arg servoj_gain)"
      servoj_lookahead_time="$(arg servoj_lookahead_time)"
      servoj_time="$(arg servoj_time)"
+     servoj_start_delta_limit="$(arg servoj_start_delta_limit)"
+     payload_mass_max="$(arg payload_mass_max)"
      script_filename="$(arg script_filename)"
      output_recipe_filename="$(arg output_recipe_filename)"
      input_recipe_filename="$(arg input_recipe_filename)"
