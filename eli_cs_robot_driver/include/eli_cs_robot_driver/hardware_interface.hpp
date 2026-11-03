@@ -106,6 +106,11 @@ protected:
     std::chrono::steady_clock::time_point reconnect_start_time_;
     std::chrono::steady_clock::time_point reconnect_last_attempt_time_{};
     std::atomic<bool> rtsi_reconnecting_{ false };
+    // Set by updateAsyncIO() (async_thread_) right before resending the external control
+    // script. write() (realtime thread) consumes it and performs the actual
+    // position_commands_/velocity_commands_ reset itself, so the reset — like every other
+    // write to those members — only ever happens on the realtime thread.
+    std::atomic<bool> command_reset_pending_{ false };
     // Standard throttle interval (s) for all repeated log messages. One log per this many
     // seconds prevents flooding during extended connection outages or write failures.
     static constexpr double kLogThrottleSeconds = 10.0;
@@ -227,6 +232,7 @@ protected:
     geometry_msgs::msg::TransformStamped tcp_transform_;
 
     bool timeoutExpired(std::chrono::time_point<std::chrono::steady_clock>, int);
+    void resetCommandsToActualPose();
     void asyncThread();
     void updateAsyncIO();
     bool reconnectAll();

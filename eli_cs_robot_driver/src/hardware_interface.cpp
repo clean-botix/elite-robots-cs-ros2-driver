@@ -333,6 +333,7 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
     rtsi_reconnecting_.store(false);
     reconnection_needed_.store(false);
     reconnect_failed_.store(false);
+    command_reset_pending_.store(false);
     rtsi_interface_.reset();
     rtsi_out_recipe_.reset();
     rtsi_in_recipe_.reset();
@@ -527,6 +528,13 @@ bool EliteCSPositionHardwareInterface::timeoutExpired(std::chrono::time_point<st
     auto current_time = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
     return (elapsed >= timeout_s);
+}
+
+// Realtime-thread-only: callers must already be on the same thread as read()/write()/
+// perform_command_mode_switch(), which are the only other writers of these members.
+void EliteCSPositionHardwareInterface::resetCommandsToActualPose() {
+    position_commands_ = joint_positions_;
+    velocity_commands_ = {{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
 }
 
 std::vector<std::string> EliteCSPositionHardwareInterface::readRecipe(const std::string& recipe_file) {
@@ -961,8 +969,7 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
         }
         rtsi_out_recipe_->getValue("actual_joint_positions", joint_positions_);
 
-        position_commands_ = joint_positions_;
-        velocity_commands_ = { { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 } };
+        resetCommandsToActualPose();
         target_speed_fraction_cmd_ = NO_NEW_CMD;
         resend_external_script_cmd_ = NO_NEW_CMD;
         zero_ftsensor_cmd_ = NO_NEW_CMD;
@@ -999,6 +1006,13 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
 hardware_interface::return_type EliteCSPositionHardwareInterface::write(const rclcpp::Time& time, const rclcpp::Duration& period) {
     (void)time;
     (void)period;
+    // updateAsyncIO() (async_thread_) flags a pending reset right before resending the
+    // external control script. Consume it here, on the realtime thread, so the actual
+    // write to position_commands_/velocity_commands_ never races with this function's own
+    // read of them a few lines below.
+    if (command_reset_pending_.exchange(false)) {
+        resetCommandsToActualPose();
+    }
     // If there is no interpreting task running on the robot, we do not want to send anything.
     try {
         if (runtime_state_ == ELITE::TaskStatus::PLAYING && is_robot_connected_) {
@@ -1313,6 +1327,15 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
                 }
                 std::this_thread::sleep_for(10ms);
             }
+            // A fault kills the external control script without clearing position_commands_/
+            // velocity_commands_. If the arm is freedriven to a new pose before the script is
+            // resent, write() would otherwise send the robot straight back to its stale,
+            // pre-fault target the instant the script reconnects. Flag the reset instead of
+            // performing it here directly: this runs on async_thread_, and position_commands_/
+            // velocity_commands_ are otherwise only ever touched from the realtime thread
+            // (read()/write()/perform_command_mode_switch()) — write() below clears this flag
+            // and does the actual reset itself, on that same thread.
+            command_reset_pending_.store(true);
             resend_external_script_async_success_ = eli_driver_->sendExternalControlScript();
             if (resend_external_script_async_success_) {
                 RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
