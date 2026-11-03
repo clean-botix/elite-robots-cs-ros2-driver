@@ -1389,7 +1389,7 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
                 "freedrive_start requested but EliteScript task is not EXECUTING — skipping");
             freedrive_async_success_ = false;
         } else {
-            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_START, 0);
+            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_START, recv_timeout_ * 1000);
             freedrive_activated_ = true;
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Started freedrive mode");
         }
@@ -1405,7 +1405,7 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
                 "freedrive_end requested but EliteScript task is not EXECUTING — skipping SDK call");
             freedrive_async_success_ = false;
         } else {
-            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_END, 0);
+            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_END, recv_timeout_ * 1000);
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Ended freedrive mode");
         }
         freedrive_end_cmd_ = NO_NEW_CMD;
