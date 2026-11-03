@@ -254,6 +254,16 @@ if(BUILD_TESTING)
   # Regression test for elite_control.launch.py's bool-typed launch parameters.
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_elite_control_launch test/test_elite_control_launch.py)
+
+  # Unit tests for external_control.script (EliteScript), exec()'d into a
+  # mocked sandbox via test/external_control_script_harness.py. They cover the
+  # script's functions, the servoj start-target safety check, the wire-format
+  # contract with the Elite SDK sources, and the two vendored copies staying
+  # byte-identical.
+  ament_add_pytest_test(test_external_control_script_functions test/test_external_control_script_functions.py)
+  ament_add_pytest_test(test_external_control_script_safety test/test_external_control_script_safety.py)
+  ament_add_pytest_test(test_external_control_script_wire_format test/test_external_control_script_wire_format.py)
+  ament_add_pytest_test(test_external_control_script_sync test/test_external_control_script_sync.py)
 endif()
 
 ament_package()
