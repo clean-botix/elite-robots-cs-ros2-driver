@@ -116,11 +116,17 @@ def test_data_sizes_and_zoom_ratios_match_sdk_headers():
         assert DEFAULT_TEMPLATE_VALUES[key] == value, key
 
 
-@pytest.mark.parametrize("field", ["servoj_start_delta_limit", "payload_mass_max"])
-def test_script_limit_defaults_agree_across_sdk_xacro_and_harness(field):
+@pytest.mark.parametrize(
+    "field, placeholder",
+    [
+        ("servoj_start_delta_limit_rad", "SERVOJ_START_DELTA_LIMIT_REPLACE"),
+        ("payload_mass_max_kg", "PAYLOAD_MASS_MAX_REPLACE"),
+    ],
+)
+def test_script_limit_defaults_agree_across_sdk_xacro_and_harness(field, placeholder):
+    # The SDK field and the ROS hardware parameter share one unit-suffixed name
     sdk_default = _sdk_float_default("include/Elite/EliteDriver.hpp", field)
-    harness_default = DEFAULT_TEMPLATE_VALUES[field.upper() + "_REPLACE"]
-    assert harness_default == pytest.approx(sdk_default)
+    assert DEFAULT_TEMPLATE_VALUES[placeholder] == pytest.approx(sdk_default)
     for xacro in ["cs.ros2_control.xacro", "cs_macro.xacro"]:
         assert _xacro_default(xacro, field) == pytest.approx(sdk_default), xacro
 
