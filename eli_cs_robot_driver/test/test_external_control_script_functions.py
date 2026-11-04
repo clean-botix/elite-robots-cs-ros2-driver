@@ -109,17 +109,51 @@ def test_trajectory_clear_points_drains_exact_count():
     assert namespace["trajectory_point_num"] == 0
 
 
-def test_trajectory_clear_points_stops_at_first_timed_out_read():
+def test_trajectory_clear_points_waits_for_a_late_point():
     namespace = load_control_script_namespace()
-    namespace["trajectory_point_num"] = 50
-    namespace["socket_read_binary_integer"].side_effect = [
-        trajectory_point([0.0] * 6, 1.0, 0.0),
-        [0],
-    ]
+    namespace["trajectory_point_num"] = 2
+    point = trajectory_point([0.0] * 6, 1.0, 0.0)
+    # Ten empty reads are about 80 ms of silence, well inside the budget
+    namespace["socket_read_binary_integer"].side_effect = [point] + [[0]] * 10 + [point]
 
     namespace["trajectoryClearPoints"]()
 
-    assert namespace["socket_read_binary_integer"].call_count == 2
+    assert namespace["socket_read_binary_integer"].call_count == 12
+    assert namespace["trajectory_point_num"] == 0
+
+
+def test_trajectory_clear_points_budget_restarts_after_each_point():
+    """
+    Pin that the silence budget is per gap, not per drain.
+
+    Each gap below is under TRAJECTORY_POINT_TIMEOUT, but together they exceed it.
+    Every point must still drain.
+    """
+    namespace = load_control_script_namespace()
+    namespace["trajectory_point_num"] = 3
+    point = trajectory_point([0.0] * 6, 1.0, 0.0)
+    gap = [[0]] * 100  # 0.8 s at the mocked 8 ms steptime
+    namespace["socket_read_binary_integer"].side_effect = [point] + gap + [point] + gap + [point]
+
+    namespace["trajectoryClearPoints"]()
+
+    assert namespace["socket_read_binary_integer"].call_count == 203
+    assert namespace["trajectory_point_num"] == 0
+
+
+def test_trajectory_clear_points_gives_up_after_the_silence_budget():
+    namespace = load_control_script_namespace()
+    namespace["trajectory_point_num"] = 50
+    # A finite supply turns a missing budget into a failure instead of a hang
+    namespace["socket_read_binary_integer"].side_effect = (
+        [trajectory_point([0.0] * 6, 1.0, 0.0)] + [[0]] * 1000)
+
+    namespace["trajectoryClearPoints"]()
+
+    steptime = namespace["get_steptime"].return_value
+    empty_reads = int(namespace["TRAJECTORY_POINT_TIMEOUT"] / steptime) + 1
+    read_count = namespace["socket_read_binary_integer"].call_count
+    assert read_count == pytest.approx(1 + empty_reads, abs=1)
     assert namespace["trajectory_point_num"] == 0
     # Every drain read carries a timeout, so a missing point cannot block forever
     for read in namespace["socket_read_binary_integer"].call_args_list:
@@ -138,9 +172,10 @@ def test_cancel_trajectory_stops_motion_before_draining_and_reports_last():
     manager = MagicMock()
     for name in ["stop_thread", "stopj", "socket_read_binary_integer", "socket_send_int"]:
         namespace[name] = getattr(manager, name)
-    manager.socket_read_binary_integer.return_value = [0]
+    manager.socket_read_binary_integer.return_value = trajectory_point([0.0] * 6, 1.0, 0.0)
     namespace["trajectory_thread_handle"] = 7
-    namespace["trajectory_point_num"] = 2
+    namespace["trajectory_point_num"] = 1
+    namespace["trajectory_active"] = True
 
     namespace["cancelTrajectory"]()
 
@@ -151,6 +186,20 @@ def test_cancel_trajectory_stops_motion_before_draining_and_reports_last():
         TRAJECTORY_MOTION_RESULT["CANCELED"], "trajectory_socket")
     assert namespace["trajectory_thread_handle"] == 0
     assert namespace["trajectory_point_num"] == 0
+    assert namespace["trajectory_active"] is False
+
+
+def test_cancel_trajectory_reports_nothing_for_a_finished_trajectory():
+    namespace = load_control_script_namespace()
+    namespace["trajectory_thread_handle"] = 7
+    namespace["trajectory_point_num"] = 0
+    namespace["trajectory_active"] = False
+
+    namespace["cancelTrajectory"]()
+
+    namespace["stop_thread"].assert_called_once_with(7)
+    namespace["stopj"].assert_called_once()
+    namespace["socket_send_int"].assert_not_called()
 
 
 # --- Script command loop ---
@@ -235,6 +284,7 @@ def test_initialize_control_state_sets_expected_globals():
     assert namespace["move_thread_handle"] == 0
     assert namespace["trajectory_thread_handle"] == 0
     assert namespace["servo_start_check_pending"] is False
+    assert namespace["trajectory_active"] is False
     assert namespace["freedrive_active"] is False
     assert namespace["read_timeout"] == 0.0
     namespace["start_thread"].assert_called_once()
@@ -261,6 +311,7 @@ def test_handle_control_mode_switch_out_of_trajectory_cancels_it():
     namespace["control_mode"] = namespace["MODE_TRAJECTORY"]
     namespace["trajectory_thread_handle"] = 42
     namespace["trajectory_point_num"] = 0
+    namespace["trajectory_active"] = True
 
     namespace["handleControlModeSwitch"](namespace["MODE_IDLE"])
 

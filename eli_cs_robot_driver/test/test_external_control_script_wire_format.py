@@ -303,9 +303,9 @@ def test_reverse_trajectory_cancel_reports_canceled():
     _feed_reverse(namespace, reverse_trajectory_control("START", 3))
     trajectory_handle = namespace["trajectory_thread_handle"]
 
-    # Nothing is buffered on the trajectory socket, so the drain ends at once
-    namespace["socket_read_binary_integer"].side_effect = [
-        reverse_trajectory_control("CANCEL", 0), [0]]
+    # The three unread points sit buffered on the trajectory socket and drain at once
+    namespace["socket_read_binary_integer"].side_effect = (
+        [reverse_trajectory_control("CANCEL", 0)] + [trajectory_point([0.0] * 6, 1.0, 0.0)] * 3)
     namespace["runControlLoopIteration"]()
 
     namespace["stop_thread"].assert_called_with(trajectory_handle)
@@ -398,8 +398,67 @@ def test_trajectory_silence_past_the_timeout_reports_failure():
     assert read_count == pytest.approx(expected_reads, abs=1)
     namespace["socket_send_int"].assert_called_once_with(
         TRAJECTORY_MOTION_RESULT["FAILURE"], "trajectory_socket")
-    # The count survives, so a later drain knows how many late points to expect
-    assert namespace["trajectory_point_num"] == 3
+    # The rest of the trajectory is abandoned, and any blended move is stopped
+    assert namespace["trajectory_point_num"] == 0
+    namespace["stopj"].assert_called_once_with(namespace["STOPJ_ACCELERATION"])
+    assert namespace["trajectory_active"] is False
+
+
+def test_start_after_a_timed_out_trajectory_keeps_every_new_point():
+    """
+    Guard review finding #1, a leftover count eating the next trajectory.
+
+    Trajectory A times out with points left. Trajectory B's START must drain
+    none of B's own points, so the arm runs B from its first waypoint.
+    """
+    namespace = _fresh_script()
+    _feed_reverse(namespace, reverse_trajectory_control("START", 3))
+    namespace["socket_read_binary_integer"].side_effect = [[0]] * 1000
+    namespace["trajectoryThread"]()
+    namespace["socket_read_binary_integer"].reset_mock()
+
+    b_targets = [[0.1] * 6, [0.2] * 6]
+    namespace["socket_read_binary_integer"].side_effect = (
+        [reverse_trajectory_control("START", 2)]
+        + [trajectory_point(t, 1.0, 0.0) for t in b_targets])
+    namespace["runControlLoopIteration"]()
+    assert namespace["trajectory_point_num"] == 2
+    namespace["trajectoryThread"]()
+
+    moved_to = [c.args[0] for c in namespace["movej"].call_args_list]
+    assert moved_to == [pytest.approx(t) for t in b_targets]
+
+
+@pytest.mark.parametrize("finished_with", ["SUCCESS", "FAILURE"])
+def test_leaving_trajectory_mode_after_a_result_reports_nothing_more(finished_with):
+    """
+    Guard review finding #3, two results for one trajectory.
+
+    A trajectory that already reported its result must not also be reported
+    as CANCELED when the script leaves MODE_TRAJECTORY.
+    """
+    namespace = _fresh_script()
+    _feed_reverse(namespace, reverse_trajectory_control("START", 1))
+    if finished_with == "SUCCESS":
+        reads = [trajectory_point([0.1] * 6, 1.0, 0.0)]
+    else:
+        reads = [[0]] * 1000
+    namespace["socket_read_binary_integer"].side_effect = reads
+    namespace["trajectoryThread"]()
+
+    namespace["get_actual_joint_positions"].return_value = [0.0] * 6
+    namespace["socket_read_binary_integer"].side_effect = [reverse_servoj([0.0] * 6)]
+    namespace["runControlLoopIteration"]()
+
+    namespace["socket_send_int"].assert_called_once_with(
+        TRAJECTORY_MOTION_RESULT[finished_with], "trajectory_socket")
+
+
+def test_leaving_trajectory_mode_without_a_start_reports_nothing():
+    namespace = _fresh_script()
+    _feed_reverse(namespace, reverse_trajectory_control("NOOP", 0), reverse_idle())
+
+    namespace["socket_send_int"].assert_not_called()
 
 
 # --- Script command port ---

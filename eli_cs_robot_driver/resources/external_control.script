@@ -51,8 +51,9 @@ TOOL_VOLTAGE_OFF = 0
 TOOL_VOLTAGE_12V = 12
 TOOL_VOLTAGE_24V = 24
 
-# Seconds. A trajectory waits this long in total for its next point. Longer
-# silence fails the trajectory and reports TRAJECTORY_RESULT_FAILURE.
+# Seconds. The longest silence allowed while waiting for a trajectory point. A
+# longer gap fails a running trajectory with TRAJECTORY_RESULT_FAILURE, and ends
+# a drain in trajectoryClearPoints().
 TRAJECTORY_POINT_TIMEOUT = 1.0
 
 FREEDRIVE_START = 1
@@ -79,6 +80,7 @@ global cmd_servo_joints
 global servo_start_check_pending
 global trajectory_result
 global trajectory_point_wait
+global trajectory_active
 global freedrive_active
 global script_command_thread_handle
 global move_thread_handle
@@ -95,8 +97,8 @@ def decodeVector6(words, first, ratio):
     return values
 
 # A failed read consumes no point. The point may simply not have arrived yet.
-# Silence beyond TRAJECTORY_POINT_TIMEOUT fails the trajectory. The remaining
-# count stays intact, so trajectoryClearPoints() can drain any late arrivals.
+# Silence beyond TRAJECTORY_POINT_TIMEOUT fails the trajectory, and
+# trajectoryThread() then abandons its remaining points.
 def runTrajectoryIteration():
     global trajectory_point_num, trajectory_result, trajectory_point_wait
     raw_point = socket_read_binary_integer(TRAJECTORY_DATA_SIZE, "trajectory_socket", get_steptime())
@@ -126,13 +128,22 @@ def runTrajectoryIteration():
             textmsg("ExternalControl: trajectory failed | timed out waiting for a point | {} points left".format(trajectory_point_num))
             trajectory_result = TRAJECTORY_RESULT_FAILURE
 
+# Reports exactly one result per trajectory. trajectory_active is cleared before
+# the result goes out, so cancelTrajectory() never reports a second one. A cancel
+# landing between those two statements loses the result rather than doubling it.
 def trajectoryThread():
-    global trajectory_result, trajectory_point_wait
+    global trajectory_result, trajectory_point_wait, trajectory_point_num, trajectory_active
     trajectory_result = TRAJECTORY_RESULT_SUCCESS
     trajectory_point_wait = 0.0
     while trajectory_point_num > 0 and trajectory_result == TRAJECTORY_RESULT_SUCCESS:
         runTrajectoryIteration()
 
+    if trajectory_result == TRAJECTORY_RESULT_FAILURE:
+        # A blended move may still be running, so stop it. The remaining points are
+        # abandoned, so the next START never drains points that belong to it.
+        stopj(STOPJ_ACCELERATION)
+        trajectory_point_num = 0
+    trajectory_active = False
     socket_send_int(trajectory_result, "trajectory_socket")
 
 def setServoSetpoint(joints):
@@ -169,26 +180,36 @@ def servoThread():
     textmsg("ExternalControl: servo thread ended")
     stopj(STOPJ_ACCELERATION)
 
-# Drains the points of an abandoned trajectory. A timed-out read means nothing
-# more is buffered, so the drain stops there instead of blocking the caller.
+# Drains the remaining points of a trajectory that is being replaced or
+# cancelled. Points the host already sent sit buffered and drain at once. A late
+# point still drains, until a silent gap longer than TRAJECTORY_POINT_TIMEOUT ends
+# the wait. The protocol carries no point IDs, so a point later than that would
+# be read as part of the next trajectory.
 def trajectoryClearPoints():
     global trajectory_point_num
+    silence = 0.0
     while trajectory_point_num > 0:
         raw_point = socket_read_binary_integer(TRAJECTORY_DATA_SIZE, "trajectory_socket", get_steptime())
         if raw_point[0] > 0:
             trajectory_point_num -= 1
+            silence = 0.0
         else:
-            trajectory_point_num = 0
+            silence += get_steptime()
+            if silence > TRAJECTORY_POINT_TIMEOUT:
+                trajectory_point_num = 0
 
-# Stops the running trajectory and its motion, drains its remaining points, and
-# reports TRAJECTORY_RESULT_CANCELED to the host
+# Stops the trajectory thread and its motion, and drains the remaining points. A
+# trajectory still running is reported as TRAJECTORY_RESULT_CANCELED. One that
+# already finished has reported its own result, so nothing more is sent.
 def cancelTrajectory():
-    global trajectory_thread_handle
+    global trajectory_thread_handle, trajectory_active
     stop_thread(trajectory_thread_handle)
     trajectory_thread_handle = 0
     stopj(STOPJ_ACCELERATION)
     trajectoryClearPoints()
-    socket_send_int(TRAJECTORY_RESULT_CANCELED, "trajectory_socket")
+    if trajectory_active:
+        trajectory_active = False
+        socket_send_int(TRAJECTORY_RESULT_CANCELED, "trajectory_socket")
 
 def setSpeedl(tool_vel):
     global cmd_speedl_tool_speed
@@ -278,8 +299,8 @@ def openControlSockets():
 def initializeControlState():
     global control_mode, steptime, read_timeout
     global cmd_speedl_tool_speed, cmd_speed_joint, cmd_servo_joints, servo_start_check_pending
-    global trajectory_point_num, trajectory_result, trajectory_point_wait, freedrive_active
-    global script_command_thread_handle, move_thread_handle, trajectory_thread_handle
+    global trajectory_point_num, trajectory_result, trajectory_point_wait, trajectory_active
+    global freedrive_active, script_command_thread_handle, move_thread_handle, trajectory_thread_handle
     cmd_speedl_tool_speed = [0, 0, 0, 0, 0, 0]
     cmd_speed_joint = [0, 0, 0, 0, 0, 0]
     control_mode = MODE_UNINITIALIZED
@@ -289,6 +310,7 @@ def initializeControlState():
     servo_start_check_pending = False
     trajectory_result = TRAJECTORY_RESULT_SUCCESS
     trajectory_point_wait = 0.0
+    trajectory_active = False
     freedrive_active = False
     script_command_thread_handle = start_thread(scriptCommands, ())
     move_thread_handle = 0
@@ -343,7 +365,8 @@ def handleControlModeSwitch(new_mode):
         textmsg("ExternalControl: Script stopped")
 
 def applyModeCommand(params_mult):
-    global trajectory_thread_handle, trajectory_point_num, freedrive_active, servo_start_check_pending
+    global trajectory_thread_handle, trajectory_point_num, trajectory_active
+    global freedrive_active, servo_start_check_pending
     # Update the motion commands with new parameters
     if control_mode == MODE_SERVOJ:
         joints = decodeVector6(params_mult, 2, POS_ZOOM_RATIO)
@@ -361,10 +384,13 @@ def applyModeCommand(params_mult):
         setSpeedj(decodeVector6(params_mult, 2, POS_ZOOM_RATIO))
     elif control_mode == MODE_TRAJECTORY:
         if params_mult[2] == TRAJECTORY_ACTION_START:
+            # A trajectory still running is replaced without a result of its own,
+            # as upstream does. A CANCELED here could be read as the new one's result.
             stop_thread(trajectory_thread_handle)
             trajectory_thread_handle = 0
             trajectoryClearPoints()
             trajectory_point_num = params_mult[3]
+            trajectory_active = True
             trajectory_thread_handle = start_thread(trajectoryThread, ())
         elif params_mult[2] == TRAJECTORY_ACTION_CANCEL:
             textmsg("Trajectory cancel received")
