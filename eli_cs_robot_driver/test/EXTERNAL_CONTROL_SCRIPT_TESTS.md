@@ -133,6 +133,39 @@ Tests build packets from SDK enum values and SDK layouts, never from the script'
 
 The servoj start-target check guards against a real incident, so its tests are layered. Unit tests call `verifyServoStartSetpoint()` directly for the boundary, both directions, and the first offending joint. Mid-level tests go through `applyModeCommand()` and confirm a refused target never reaches `cmd_servo_joints`. End-to-end tests replay the stale-command incident through `runControlLoopIteration()` on a freshly initialized script. One test makes `halt()` return, and it proves the target is still refused.
 
+### Joint value ranges and the start-target check
+
+The start-target check compares joint angles by plain difference, and it must never wrap that difference at ±π. CS joint angles are continuous across each joint's whole range, so there is no discontinuity at ±π to guard against. Wrapping would turn real near-full-turn motions into small ones, and the check would approve them.
+
+**Ranges.** Every CS model in `eli_cs_robot_description` has the same position limits. That includes the CS63 through CS625, the CS612, and the CS612S2.
+
+| Joint | Range |
+|---|---|
+| `shoulder_pan`, `shoulder_lift`, `wrist_1`, `wrist_2`, `wrist_3` | −360° to +360° (±2π rad) |
+| `elbow` | −180° to +180° (±π rad) |
+
+**Representation.** One angle means one physical pose everywhere in the chain:
+- The controller reports multi-turn angles over the full range, and RTSI streams them.
+- ROS `joint_states`, the trajectory controller, and MoveIt all carry them unwrapped.
+- `servoj()` takes them as absolute targets.
+
+So on a ±360° joint, θ and θ ± 2π are different poses, a full turn of the joint apart. They also have different cable and hose wind-up.
+
+**Edge cases.** Each row is pinned by a test in `test_external_control_script_safety.py`, except the wrapped host target, which is covered by the same arithmetic.
+
+| Case | Actual → target | Plain difference | Check | Why |
+|---|---|---|---|---|
+| A small step through ±π | 3.13 → 3.15 rad | 0.02 rad | Accepts | The angle is continuous there, so this is ordinary motion |
+| Opposite sides of ±π | −3.10 → +3.10 rad | 6.20 rad | Refuses | It really is a near-full turn. Wrapped, it would read 0.08 rad |
+| Near the ±2π limit | 6.20 → 6.25 rad | 0.05 rad | Accepts | Ordinary motion near the end of travel |
+| The same pose one turn lower | 6.20 → −0.08 rad | 6.28 rad | Refuses | That is a full turn of the joint, not the same pose |
+| The elbow at its two ends | 3.10 → −3.10 rad | 6.20 rad | Refuses | The elbow's range ends at ±π, so its ends are a full turn apart |
+| A host or tool that wraps angles | 3.20 → −3.08 rad (3.20 wrapped into [−π, π)) | 6.28 rad | Refuses | The arm would turn a full revolution to reach it |
+
+The last row is where someone is most likely to add wrapping logic, thinking it fixes a bug. It must stay a refusal. A tool that wraps angles produces a target one turn away from the joint's real position, and `servoj()` would really drive that turn.
+
+**Handling in code.** `verifyServoStartSetpoint()` takes `norm()` of the raw difference, and its comment states the no-wrap rule. The harness's `norm()` fake also does no wrapping, on purpose. A wrapping fake would let tests approve targets the real script refuses. Putting a shortest-angle delta into the script fails four of the safety tests.
+
 ### Admit only proven language constructs
 
 A construct counts as proven when Elite's own upstream script uses it, or when a simulator run has exercised it. The upstream script is the best available evidence of what the interpreter supports, because Elite ships it for its own controllers. See [Elite-Robots/Elite_Robots_CS_SDK, `source/resources/external_control.script`](https://github.com/Elite-Robots/Elite_Robots_CS_SDK/blob/ca583c6a5e9d915ba0399147592c02cc95ab02b4/source/resources/external_control.script), pinned at commit `ca583c6`.

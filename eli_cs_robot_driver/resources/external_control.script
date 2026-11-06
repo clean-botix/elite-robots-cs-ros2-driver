@@ -156,6 +156,11 @@ def setServoSetpoint(joints):
 # A farther target logs, raises a popup, and halts the script. It also returns
 # False, so the caller refuses the target even if halt() returns. The check is
 # independent of anything on the host side.
+# The delta is the plain difference, never wrapped at +/-pi. Joint angles are
+# continuous across each joint's whole range, +/-360 degrees on five CS joints
+# and +/-180 degrees on the elbow. So target and actual on opposite sides of
+# +/-pi really are almost a full turn apart. Wrapping the difference would call
+# that turn tiny and let it through.
 def verifyServoStartSetpoint(target_joints):
     actual_joints = get_actual_joint_positions()
     for i in range(6):

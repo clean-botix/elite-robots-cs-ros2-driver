@@ -102,6 +102,15 @@ def _fake_norm(value):
     Stand in for EliteScript's norm().
 
     The script only passes scalars, where norm() is the absolute value.
+
+    The fake deliberately does no angle wrapping. The start-target check
+    passes it target minus actual for one joint. CS joint angles are
+    continuous across the whole joint range, +/-2*pi on five joints and
+    +/-pi on the elbow, with no discontinuity at +/-pi. A difference across
+    +/-pi is therefore the real motion the arm would make, and must reach
+    the limit check unchanged. A wrapping fake would let the tests approve
+    near-full-turn targets the real script refuses. The guide's "Joint value
+    ranges" section explains the cases.
     """
     return abs(value)
 

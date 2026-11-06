@@ -118,6 +118,68 @@ def test_negative_direction_delta_is_also_refused():
     assert namespace["cmd_servo_joints"] == [1.0] * 6
 
 
+# --- Joint value ranges: the delta is never wrapped at +/-pi ---
+
+
+@pytest.mark.parametrize("joint_index", [0, 5])
+def test_start_target_across_plus_minus_pi_is_refused_as_a_near_full_turn(joint_index):
+    """
+    Pin that the check uses the plain difference, with no wrap at +/-pi.
+
+    Actual -3.10 rad and target +3.10 rad are 6.20 rad apart on a +/-360
+    degree joint. Wrapped, they would look 0.08 rad apart, under the limit.
+    """
+    namespace = load_control_script_namespace()
+    actual = [0.0] * 6
+    actual[joint_index] = -3.10
+    _enter_servo_mode(namespace, actual)
+    target = list(actual)
+    target[joint_index] = 3.10
+
+    with pytest.raises(ScriptHalted):
+        _apply_servoj(namespace, target)
+
+    assert namespace["cmd_servo_joints"] == actual
+    assert "delta=6.2" in namespace["popup"].call_args.args[0]
+
+
+def test_small_start_target_step_through_plus_minus_pi_is_accepted():
+    """Crossing +/-pi is ordinary motion, because the angle is continuous there."""
+    namespace = load_control_script_namespace()
+    _enter_servo_mode(namespace, [3.13, 0.0, 0.0, 0.0, 0.0, -3.13])
+
+    _apply_servoj(namespace, [3.15, 0.0, 0.0, 0.0, 0.0, -3.15])
+
+    assert namespace["cmd_servo_joints"] == pytest.approx([3.15, 0.0, 0.0, 0.0, 0.0, -3.15])
+    namespace["halt"].assert_not_called()
+
+
+def test_start_target_near_the_two_pi_limit_uses_the_plain_difference():
+    """
+    Near +/-2*pi, theta and theta - 2*pi are different physical poses.
+
+    A small step at 6.20 rad is accepted. The same pose expressed one turn
+    lower, at -0.08 rad, is a full turn away and is refused.
+    """
+    namespace = load_control_script_namespace()
+    actual = [6.20, 0.0, 0.0, 0.0, 0.0, 0.0]
+    _enter_servo_mode(namespace, actual)
+    assert namespace["verifyServoStartSetpoint"]([6.25, 0.0, 0.0, 0.0, 0.0, 0.0]) is True
+
+    with pytest.raises(ScriptHalted):
+        one_turn_lower = 6.20 - 2 * 3.141592653589793
+        namespace["verifyServoStartSetpoint"]([one_turn_lower, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+
+def test_elbow_at_its_plus_minus_pi_limit_uses_the_plain_difference():
+    """The elbow's range ends at +/-pi, so its opposite ends are a full turn apart."""
+    namespace = load_control_script_namespace()
+    _enter_servo_mode(namespace, [0.0, 0.0, 3.10, 0.0, 0.0, 0.0])
+
+    with pytest.raises(ScriptHalted):
+        _apply_servoj(namespace, [0.0, 0.0, -3.10, 0.0, 0.0, 0.0])
+
+
 def test_later_targets_in_the_session_skip_the_check():
     """
     Pin the design choice that only the start target is vetted.
