@@ -52,7 +52,7 @@ Largest allowed gap between the first servoj target of a servo session and the a
 Largest payload mass the external control script accepts. The script refuses a larger mass and logs the refusal. Unit: kilograms. Default: 14.4.
 
 #### *trajectory_point_timeout_s*
-Longest silence the external control script allows while waiting for a forwarded trajectory point. A longer gap fails a running trajectory with a FAILURE result and stops its motion. The same limit ends the drain of a replaced or cancelled trajectory's remaining points. Applies only to trajectory forwarding, which this driver does not use itself. Unit: seconds. Default: 1.0.
+Longest silence the external control script allows while waiting for a forwarded trajectory point. A longer gap fails a running trajectory with a FAILURE result and stops its motion. The same limit ends the drain of a replaced or cancelled trajectory's remaining points. Applies only to trajectory forwarding, which this driver does not use itself. See [KnownIssues.md](KnownIssues.md) for the late-point limitation. Unit: seconds. Default: 1.0.
 
 #### *tool_voltage*
 Tool voltage that will be set as soon as the task on the robot is started. The driver applies it again after every task restart. Unit: volts. Accepted values: 0, 12, 24. Any other value is logged and ignored.
