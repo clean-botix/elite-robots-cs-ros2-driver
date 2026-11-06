@@ -53,8 +53,8 @@ TOOL_VOLTAGE_24V = 24
 
 # Seconds. The longest silence allowed while waiting for a trajectory point. A
 # longer gap fails a running trajectory with TRAJECTORY_RESULT_FAILURE, and ends
-# a drain in trajectoryClearPoints().
-TRAJECTORY_POINT_TIMEOUT = 1.0
+# a drain in trajectoryClearPoints(). The driver supplies this value.
+TRAJECTORY_POINT_TIMEOUT = {{TRAJECTORY_POINT_TIMEOUT_REPLACE}}
 
 FREEDRIVE_START = 1
 FREEDRIVE_NOOP = 0

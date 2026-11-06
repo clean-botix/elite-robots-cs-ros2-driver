@@ -121,6 +121,7 @@ def test_data_sizes_and_zoom_ratios_match_sdk_headers():
     [
         ("servoj_start_delta_limit_rad", "SERVOJ_START_DELTA_LIMIT_REPLACE"),
         ("payload_mass_max_kg", "PAYLOAD_MASS_MAX_REPLACE"),
+        ("trajectory_point_timeout_s", "TRAJECTORY_POINT_TIMEOUT_REPLACE"),
     ],
 )
 def test_script_limit_defaults_agree_across_sdk_xacro_and_harness(field, placeholder):
@@ -408,6 +409,24 @@ def test_trajectory_silence_past_the_timeout_reports_failure():
     assert namespace["trajectory_point_num"] == 0
     namespace["stopj"].assert_called_once_with(namespace["STOPJ_ACCELERATION"])
     assert namespace["trajectory_active"] is False
+
+
+def test_trajectory_point_timeout_comes_from_the_driver_template():
+    namespace = load_control_script_namespace(
+        template_overrides={"TRAJECTORY_POINT_TIMEOUT_REPLACE": 0.2})
+    namespace["get_actual_joint_positions"].return_value = [0.0] * 6
+    namespace["initializeControlState"]()
+    namespace["trajectory_point_num"] = 1
+    namespace["socket_read_binary_integer"].side_effect = [[0]] * 1000
+
+    namespace["trajectoryThread"]()
+
+    assert namespace["TRAJECTORY_POINT_TIMEOUT"] == 0.2
+    steptime = namespace["get_steptime"].return_value
+    read_count = namespace["socket_read_binary_integer"].call_count
+    assert read_count == pytest.approx(int(0.2 / steptime) + 1, abs=1)
+    namespace["socket_send_int"].assert_called_once_with(
+        TRAJECTORY_MOTION_RESULT["FAILURE"], "trajectory_socket")
 
 
 def test_start_after_a_timed_out_trajectory_keeps_every_new_point():

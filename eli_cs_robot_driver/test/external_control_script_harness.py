@@ -29,7 +29,8 @@ HEADER_END_MARKER = "# HEADER_END"
 # Mirrors the real substitution EliteDriver.cpp performs before sending the script
 # (ControlCommon.hpp:11-13 for the zoom ratios, EliteDriver.cpp's stopj_acc/servoj
 # defaults, the *_DATA_SIZE_REPLACE constants from the interface headers, and
-# EliteDriverConfig's servoj_start_delta_limit_rad/payload_mass_max_kg defaults).
+# EliteDriverConfig's servoj_start_delta_limit_rad, payload_mass_max_kg, and
+# trajectory_point_timeout_s defaults).
 # Overridable per test via template_overrides.
 DEFAULT_TEMPLATE_VALUES = {
     "POS_ZOOM_RATIO_REPLACE": 1000000,
@@ -46,6 +47,7 @@ DEFAULT_TEMPLATE_VALUES = {
     "SCRIPT_COMMAND_PORT_REPLACE": 50004,
     "SERVOJ_START_DELTA_LIMIT_REPLACE": 0.0872665,
     "PAYLOAD_MASS_MAX_REPLACE": 14.4,
+    "TRAJECTORY_POINT_TIMEOUT_REPLACE": 1.0,
 }
 
 

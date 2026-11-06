@@ -441,16 +441,20 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
         driver_config.servoj_time = servoj_time;
         driver_config.servoj_lookahead_time = servoj_lookahead_time;
         driver_config.servoj_gain = servoj_gain;
-        // Both limits are optional. An absent parameter keeps the SDK default.
+        // These script limits are optional. An absent parameter keeps the SDK default.
         if (info_.hardware_parameters.count("servoj_start_delta_limit_rad")) {
             driver_config.servoj_start_delta_limit_rad = stod(info_.hardware_parameters["servoj_start_delta_limit_rad"]);
         }
         if (info_.hardware_parameters.count("payload_mass_max_kg")) {
             driver_config.payload_mass_max_kg = stod(info_.hardware_parameters["payload_mass_max_kg"]);
         }
+        if (info_.hardware_parameters.count("trajectory_point_timeout_s")) {
+            driver_config.trajectory_point_timeout_s = stod(info_.hardware_parameters["trajectory_point_timeout_s"]);
+        }
         RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
-            "Script limits: servoj_start_delta_limit_rad=%.4f, payload_mass_max_kg=%.2f",
-            driver_config.servoj_start_delta_limit_rad, driver_config.payload_mass_max_kg);
+            "Script limits: servoj_start_delta_limit_rad=%.4f, payload_mass_max_kg=%.2f, trajectory_point_timeout_s=%.2f",
+            driver_config.servoj_start_delta_limit_rad, driver_config.payload_mass_max_kg,
+            driver_config.trajectory_point_timeout_s);
 
         eli_driver_ = std::make_unique<ELITE::EliteDriver>(driver_config);
 

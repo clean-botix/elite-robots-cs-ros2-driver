@@ -59,6 +59,7 @@
     servoj_time:=0.008
     servoj_start_delta_limit_rad:=0.0872665
     payload_mass_max_kg:=14.4
+    trajectory_point_timeout_s:=1.0
     script_filename:=to_be_filled_by_cs_robot_driver
     output_recipe_filename:=to_be_filled_by_cs_robot_driver
     input_recipe_filename:=to_be_filled_by_cs_robot_driver
@@ -103,6 +104,7 @@
         servoj_time="${servoj_time}"
         servoj_start_delta_limit_rad="${servoj_start_delta_limit_rad}"
         payload_mass_max_kg="${payload_mass_max_kg}"
+        trajectory_point_timeout_s="${trajectory_point_timeout_s}"
         use_tool_communication="${use_tool_communication}"
         tool_voltage="${tool_voltage}"
         tool_parity="${tool_parity}"
