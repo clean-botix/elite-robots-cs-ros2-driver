@@ -46,13 +46,13 @@ Temporarily unavailable.
 Specify lookahead_time parameter of underlying servoj command. This will be used whenever position control is active. A higher value will result in smoother trajectories, but will also introduce a higher delay between the commands sent from ROS and the motion being executed on the robot. Unit: seconds. Range: [0.03 - 0.2]
 
 #### *servoj_start_delta_limit_rad*
-Largest allowed gap between the first servoj target of a servo session and the arm's actual position, per joint. A larger gap makes the external control script refuse the target, show a popup, and halt. Unit: radians. Default: 0.0872665 (5 degrees).
+Largest allowed gap between the first servoj target of a servo session and the arm's actual position, per joint. A larger gap makes the external control script refuse the target, show a popup, and halt. Unit: radians. Default: 0.0872665 (5 degrees). A value that isn't positive is logged and ignored.
 
 #### *payload_mass_max_kg*
-Largest payload mass the external control script accepts. The script refuses a larger mass and logs the refusal. Unit: kilograms. Default: 14.4.
+Largest payload mass the external control script accepts. The script refuses a larger mass and logs the refusal. Unit: kilograms. Default: 14.4. A value that isn't positive is logged and ignored.
 
 #### *trajectory_point_timeout_s*
-Longest silence the external control script allows while waiting for a forwarded trajectory point. A longer gap fails a running trajectory with a FAILURE result and stops its motion. The same limit ends the drain of a replaced or cancelled trajectory's remaining points. Applies only to trajectory forwarding, which this driver does not use itself. See [KnownIssues.md](KnownIssues.md) for the late-point limitation. Unit: seconds. Default: 1.0.
+Longest silence the external control script allows while waiting for a forwarded trajectory point. A longer gap fails a running trajectory with a FAILURE result and stops its motion. The same limit ends the drain of a replaced or cancelled trajectory's remaining points. Applies only to trajectory forwarding, which this driver does not use itself. See [KnownIssues.md](KnownIssues.md) for the late-point limitation. Unit: seconds. Default: 1.0. A value that isn't positive is logged and ignored.
 
 #### *tool_voltage*
 Tool voltage that will be set as soon as the task on the robot is started. The driver applies it again after every task restart. Unit: volts. Accepted values: 0, 12, 24. Any other value is logged and ignored.
