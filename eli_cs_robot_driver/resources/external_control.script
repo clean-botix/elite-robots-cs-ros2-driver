@@ -32,11 +32,29 @@ MODE_TOOL_IN_CONTACT = 7
 
 STOPJ_ACCELERATION = {{STOP_J_REPLACE}}
 
+# Radians. The first servoj target of a servo session is refused if any joint
+# lies farther than this from the arm's actual position. The host starts each
+# servo session from the arm's measured state. A large gap therefore means a
+# stale or corrupt command. The driver supplies this value.
+SERVOJ_START_DELTA_LIMIT = {{SERVOJ_START_DELTA_LIMIT_REPLACE}}
+
+# Kilograms. A payload mass above this value is refused. The driver supplies this value.
+PAYLOAD_MASS_MAX = {{PAYLOAD_MASS_MAX_REPLACE}}
+
 SCRIPT_CMD_ZERO_FTSENSOR = 0
 SCRIPT_CMD_SET_PAYLOAD = 1
 SCRIPT_CMD_SET_TOOL_VOLTAGE = 2
 SCRIPT_CMD_START_FORCE_MODE = 3
 SCRIPT_CMD_END_FORCE_MODE = 4
+
+TOOL_VOLTAGE_OFF = 0
+TOOL_VOLTAGE_12V = 12
+TOOL_VOLTAGE_24V = 24
+
+# Seconds. The longest silence allowed while waiting for a trajectory point. A
+# longer gap fails a running trajectory with TRAJECTORY_RESULT_FAILURE, and ends
+# a drain in trajectoryClearPoints(). The driver supplies this value.
+TRAJECTORY_POINT_TIMEOUT = {{TRAJECTORY_POINT_TIMEOUT_REPLACE}}
 
 FREEDRIVE_START = 1
 FREEDRIVE_NOOP = 0
@@ -49,242 +67,384 @@ SCRIPT_COMMAND_DATA_SIZE = {{SCRIPT_COMMAND_DATA_SIZE_REPLACE}}
 
 # Ensure that the cmd_servo_joints variable is synchronized under multi-threaded conditions
 SERVOJ_DATA_MUTEX = threading.Lock()
+# Same for cmd_speedl_tool_speed and cmd_speed_joint
+SPEED_DATA_MUTEX = threading.Lock()
 
-# Global variables are also showed in the Teach pendants variable list
+# Global variables also appear in the teach pendant's variable list
 global control_mode
 global cmd_speedl_tool_speed
 global cmd_speed_joint
 global steptime
 global trajectory_point_num
 global cmd_servo_joints
+global servo_start_check_pending
+global trajectory_result
+global trajectory_point_wait
+global trajectory_active
+global freedrive_active
+global script_command_thread_handle
+global move_thread_handle
+global trajectory_thread_handle
+global read_timeout
 
 textmsg("ExternalControl: Script started")
 
-def trajectoryThread():
-    global trajectory_point_num
-    blend_radius = int()
-    while trajectory_point_num > 0:
-        raw_point = socket_read_binary_integer(TRAJECTORY_DATA_SIZE, "trajectory_socket", get_steptime())
+# Decodes six consecutive scaled integers, starting at words[first]
+def decodeVector6(words, first, ratio):
+    values = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    for i in range(6):
+        values[i] = words[first + i] / ratio
+    return values
+
+# A failed read consumes no point. The point may simply not have arrived yet.
+# Silence beyond TRAJECTORY_POINT_TIMEOUT fails the trajectory, and
+# trajectoryThread() then abandons its remaining points.
+def runTrajectoryIteration():
+    global trajectory_point_num, trajectory_result, trajectory_point_wait
+    raw_point = socket_read_binary_integer(TRAJECTORY_DATA_SIZE, "trajectory_socket", get_steptime())
+    if raw_point[0] > 0:
+        trajectory_point_wait = 0.0
         trajectory_point_num -= 1
 
         if trajectory_point_num <= 0:
             blend_radius = 0
         else:
             blend_radius = raw_point[20] / POS_ZOOM_RATIO
-        
-        if raw_point[0] > 0:
-            point = [raw_point[1] / POS_ZOOM_RATIO, raw_point[2] / POS_ZOOM_RATIO, raw_point[3] / POS_ZOOM_RATIO, raw_point[4] / POS_ZOOM_RATIO, raw_point[5] / POS_ZOOM_RATIO, raw_point[6] / POS_ZOOM_RATIO]
-            time = raw_point[19] / TIME_ZOOM_RATIO
-            
-            motion_type = raw_point[21]
-            
-            if motion_type == TRAJECTORY_MOTION_JOINT:
-                movej(point, t = time, r = blend_radius)
-            elif motion_type == TRAJECTORY_MOTION_CARTESIAN:
-                movel(point, t = time, r = blend_radius)
-    
-    socket_send_int(TRAJECTORY_RESULT_SUCCESS, "trajectory_socket")
+
+        point = decodeVector6(raw_point, 1, POS_ZOOM_RATIO)
+        time = raw_point[19] / TIME_ZOOM_RATIO
+
+        motion_type = raw_point[21]
+
+        if motion_type == TRAJECTORY_MOTION_JOINT:
+            movej(point, t = time, r = blend_radius)
+        elif motion_type == TRAJECTORY_MOTION_CARTESIAN:
+            movel(point, t = time, r = blend_radius)
+        else:
+            textmsg("ExternalControl: trajectory point skipped | unsupported motion type {}".format(motion_type))
+    else:
+        trajectory_point_wait += get_steptime()
+        if trajectory_point_wait > TRAJECTORY_POINT_TIMEOUT:
+            textmsg("ExternalControl: trajectory failed | timed out waiting for a point | {} points left".format(trajectory_point_num))
+            trajectory_result = TRAJECTORY_RESULT_FAILURE
+
+# Reports exactly one result per trajectory. trajectory_active is cleared before
+# the result goes out, so cancelTrajectory() never reports a second one. A cancel
+# landing between those two statements loses the result rather than doubling it.
+def trajectoryThread():
+    global trajectory_result, trajectory_point_wait, trajectory_point_num, trajectory_active
+    trajectory_result = TRAJECTORY_RESULT_SUCCESS
+    trajectory_point_wait = 0.0
+    while trajectory_point_num > 0 and trajectory_result == TRAJECTORY_RESULT_SUCCESS:
+        runTrajectoryIteration()
+
+    if trajectory_result == TRAJECTORY_RESULT_FAILURE:
+        # A blended move may still be running, so stop it. The remaining points are
+        # abandoned, so the next START never drains points that belong to it.
+        stopj(STOPJ_ACCELERATION)
+        trajectory_point_num = 0
+    trajectory_active = False
+    socket_send_int(trajectory_result, "trajectory_socket")
 
 def setServoSetpoint(joints):
     global cmd_servo_joints
     with SERVOJ_DATA_MUTEX:
         cmd_servo_joints = joints
 
+# Vets the first servoj target of a servo session against the arm's actual
+# position. It returns True when every joint lies within SERVOJ_START_DELTA_LIMIT.
+# A farther target logs, raises a popup, and halts the script. It also returns
+# False, so the caller refuses the target even if halt() returns. The check is
+# independent of anything on the host side.
+# The delta is the plain difference, never wrapped at +/-pi. Joint angles are
+# continuous across each joint's whole range, +/-360 degrees on five CS joints
+# and +/-180 degrees on the elbow. So target and actual on opposite sides of
+# +/-pi really are almost a full turn apart. Wrapping the difference would call
+# that turn tiny and let it through.
+def verifyServoStartSetpoint(target_joints):
+    actual_joints = get_actual_joint_positions()
+    for i in range(6):
+        delta = norm(target_joints[i] - actual_joints[i])
+        if delta > SERVOJ_START_DELTA_LIMIT:
+            fault_msg = "ExternalControl: servoj start target refused on joint {} | delta={} | limit={} | target={} | actual={}".format(i, delta, SERVOJ_START_DELTA_LIMIT, target_joints[i], actual_joints[i])
+            textmsg(fault_msg)
+            popup(fault_msg, title="External Control Safety Fault", error=True, blocking=False)
+            halt()
+            return False
+    return True
+
+def runServoIteration():
+    with SERVOJ_DATA_MUTEX:
+        joints = cmd_servo_joints
+    servoj(joints, {{SERVO_J_REPLACE}})
+
 def servoThread():
-    global cmd_servo_joints
     textmsg("ExternalControl: Starting servo thread")
     while control_mode == MODE_SERVOJ:
-        joints = get_actual_joint_positions()
-        with SERVOJ_DATA_MUTEX:
-            joints = cmd_servo_joints
-        servoj(joints, {{SERVO_J_REPLACE}})
+        runServoIteration()
     textmsg("ExternalControl: servo thread ended")
     stopj(STOPJ_ACCELERATION)
 
-
+# Drains the remaining points of a trajectory that is being replaced or
+# cancelled. Points the host already sent sit buffered and drain at once. A late
+# point still drains, until a silent gap longer than TRAJECTORY_POINT_TIMEOUT ends
+# the wait. The protocol carries no point IDs, so a point later than that would
+# be read as part of the next trajectory.
 def trajectoryClearPoints():
     global trajectory_point_num
+    silence = 0.0
     while trajectory_point_num > 0:
-      raw_point = socket_read_binary_integer(TRAJECTORY_DATA_SIZE, "trajectory_socket")
-      trajectory_point_num = trajectory_point_num - 1
+        raw_point = socket_read_binary_integer(TRAJECTORY_DATA_SIZE, "trajectory_socket", get_steptime())
+        if raw_point[0] > 0:
+            trajectory_point_num -= 1
+            silence = 0.0
+        else:
+            silence += get_steptime()
+            if silence > TRAJECTORY_POINT_TIMEOUT:
+                trajectory_point_num = 0
+
+# Stops the trajectory thread and its motion, and drains the remaining points. A
+# trajectory still running is reported as TRAJECTORY_RESULT_CANCELED. One that
+# already finished has reported its own result, so nothing more is sent.
+def cancelTrajectory():
+    global trajectory_thread_handle, trajectory_active
+    stop_thread(trajectory_thread_handle)
+    trajectory_thread_handle = 0
+    stopj(STOPJ_ACCELERATION)
+    trajectoryClearPoints()
+    if trajectory_active:
+        trajectory_active = False
+        socket_send_int(TRAJECTORY_RESULT_CANCELED, "trajectory_socket")
 
 def setSpeedl(tool_vel):
     global cmd_speedl_tool_speed
-    global control_mode
-    control_mode = MODE_SPEEDL
-    cmd_speedl_tool_speed = tool_vel
+    with SPEED_DATA_MUTEX:
+        cmd_speedl_tool_speed = tool_vel
 
 def setSpeedj(joint_vel):
     global cmd_speed_joint
-    global control_mode
-    control_mode = MODE_SPEEDJ
-    cmd_speed_joint = joint_vel
+    with SPEED_DATA_MUTEX:
+        cmd_speed_joint = joint_vel
+
+def runSpeedlIteration():
+    with SPEED_DATA_MUTEX:
+        speedl_tool_speed = cmd_speedl_tool_speed
+    speedl(speedl_tool_speed, 40.0, steptime)
 
 def speedlThread():
-    global cmd_speedl_tool_speed
     textmsg("Starting speedl thread")
     while control_mode == MODE_SPEEDL:
-        speedl_tool_speed = cmd_speedl_tool_speed
-        speedl(speedl_tool_speed, 40.0, steptime)
+        runSpeedlIteration()
     textmsg("speedl thread ended")
     stopj(STOPJ_ACCELERATION)
 
+def runSpeedjIteration():
+    with SPEED_DATA_MUTEX:
+        speedj_vel = cmd_speed_joint
+    speedj(speedj_vel, 40.0, steptime)
+
 def speedjThread():
-    global cmd_speed_joint
     textmsg("Starting speedj thread")
     while control_mode == MODE_SPEEDJ:
-        speedj_vel = cmd_speed_joint
-        speedj(speedj_vel, 40.0, steptime)
+        runSpeedjIteration()
     textmsg("speedj thread ended")
     stopj(STOPJ_ACCELERATION)
 
-# Thread to receive one shot script commands, the commands shouldn't be blocking
+# One iteration of the script command loop. The read blocks until a command
+# arrives. Each command runs inline on this thread, so it must return promptly.
+def runScriptCommandIteration():
+    raw_command = socket_read_binary_integer(SCRIPT_COMMAND_DATA_SIZE, "script_command_socket", 0)
+    if raw_command[0] > 0:
+        command = raw_command[1]
+        if command == SCRIPT_CMD_ZERO_FTSENSOR:
+            zero_ftsensor()
+        elif command == SCRIPT_CMD_SET_PAYLOAD:
+            mass = raw_command[2] / COMMON_ZOOM_RATIO
+            cog = [raw_command[3] / COMMON_ZOOM_RATIO, raw_command[4] / COMMON_ZOOM_RATIO, raw_command[5] / COMMON_ZOOM_RATIO]
+            # Successive textmsg() calls can drop messages, so each log is a single string
+            payload_str = "mass: {} | CoG: {}".format(mass, cog)
+            # Ensure message bytes evaluate to a valid payload
+            if mass >= 0.0 and mass <= PAYLOAD_MASS_MAX:
+                textmsg("Set payload: {}".format(payload_str))
+                set_payload(mass, cog)
+            else:
+                textmsg("ExternalControl: payload refused | {} | limit={}".format(payload_str, PAYLOAD_MASS_MAX))
+        elif command == SCRIPT_CMD_SET_TOOL_VOLTAGE:
+            tool_voltage = int(raw_command[2] / COMMON_ZOOM_RATIO)
+            # Ensure message bytes evaluate to a supported voltage, including off
+            if tool_voltage == TOOL_VOLTAGE_OFF or tool_voltage == TOOL_VOLTAGE_12V or tool_voltage == TOOL_VOLTAGE_24V:
+                textmsg("Set tool voltage: {}".format(tool_voltage))
+                set_tool_voltage(tool_voltage)
+            else:
+                textmsg("ExternalControl: tool voltage refused | {} is not 0, 12, or 24".format(tool_voltage))
+        elif command == SCRIPT_CMD_START_FORCE_MODE:
+            task_frame = decodeVector6(raw_command, 2, COMMON_ZOOM_RATIO)
+            # The host sends the selection vector unscaled
+            selection_vector = [raw_command[8], raw_command[9], raw_command[10], raw_command[11], raw_command[12], raw_command[13]]
+            wrench = decodeVector6(raw_command, 14, COMMON_ZOOM_RATIO)
+            force_type = raw_command[20]
+            force_limits = decodeVector6(raw_command, 21, COMMON_ZOOM_RATIO)
+            force_mode(task_frame, selection_vector, wrench, force_type, force_limits)
+        elif command == SCRIPT_CMD_END_FORCE_MODE:
+            end_force_mode()
+
 def scriptCommands():
     while control_mode > MODE_STOPPED:
-        raw_command = socket_read_binary_integer(SCRIPT_COMMAND_DATA_SIZE, "script_command_socket", 0)
-        if raw_command[0] > 0:
-            command = raw_command[1]
-            if command == SCRIPT_CMD_ZERO_FTSENSOR:
-                zero_ftsensor()
-            elif command == SCRIPT_CMD_SET_PAYLOAD:
-                mass = raw_command[2] / COMMON_ZOOM_RATIO
-                cog = [raw_command[3] / COMMON_ZOOM_RATIO, raw_command[4] / COMMON_ZOOM_RATIO, raw_command[5] / COMMON_ZOOM_RATIO]
-                # Ensure message bytes evaluate to valid payload
-                if mass >= 0.0 and mass <= 14.4:
-                    mass_str = 'mass: ' + str(mass)
-                    cog_str = 'CoG: ' + str(cog)
-                    payload_str = mass_str + ' | ' + cog_str
-                    # Updates with textmsg() can go missing if successive calls, so make it a single log string
-                    textmsg("Set payload:: ", payload_str)
-                    set_payload(mass, cog)
-            elif command == SCRIPT_CMD_SET_TOOL_VOLTAGE:
-                tool_voltage = raw_command[2] / COMMON_ZOOM_RATIO
-                tool_voltage = int(tool_voltage)
-                # Ensure message bytes evaluate to valid voltage setting
-                if tool_voltage > 0:
-                    textmsg("Set tool voltage: ", tool_voltage)
-                    set_tool_voltage(tool_voltage)
-            elif command == SCRIPT_CMD_START_FORCE_MODE:
-                task_frame = [raw_command[2] / COMMON_ZOOM_RATIO, raw_command[3] / COMMON_ZOOM_RATIO, raw_command[4] / COMMON_ZOOM_RATIO, raw_command[5] / COMMON_ZOOM_RATIO, raw_command[6] / COMMON_ZOOM_RATIO, raw_command[7] / COMMON_ZOOM_RATIO]
-                selection_vector = [raw_command[8] / COMMON_ZOOM_RATIO, raw_command[9] / COMMON_ZOOM_RATIO, raw_command[10] / COMMON_ZOOM_RATIO, raw_command[11] / COMMON_ZOOM_RATIO, raw_command[12] / COMMON_ZOOM_RATIO, raw_command[13] / COMMON_ZOOM_RATIO]
-                wrench = [raw_command[14] / COMMON_ZOOM_RATIO, raw_command[15] / COMMON_ZOOM_RATIO, raw_command[16] / COMMON_ZOOM_RATIO, raw_command[17] / COMMON_ZOOM_RATIO, raw_command[18] / COMMON_ZOOM_RATIO, raw_command[19] / COMMON_ZOOM_RATIO]
-                force_type = raw_command[20]
-                force_limits = [raw_command[21] / COMMON_ZOOM_RATIO, raw_command[22] / COMMON_ZOOM_RATIO, raw_command[23] / COMMON_ZOOM_RATIO, raw_command[24] / COMMON_ZOOM_RATIO, raw_command[25] / COMMON_ZOOM_RATIO, raw_command[26] / COMMON_ZOOM_RATIO]
-                force_mode(task_frame, selection_vector, wrench, force_type, force_limits)
-            elif command == SCRIPT_CMD_END_FORCE_MODE:
-                end_force_mode()
+        runScriptCommandIteration()
 
-# HEADER_END
+def openControlSockets():
+    textmsg("Reverse cnxn {{SERVER_IP_REPLACE}}:{{REVERSE_PORT_REPLACE}}...")
+    textmsg("Trajectory cnxn {{SERVER_IP_REPLACE}}:{{TRAJECTORY_SERVER_PORT_REPLACE}}...")
+    textmsg("Script command cnxn {{SERVER_IP_REPLACE}}:{{SCRIPT_COMMAND_PORT_REPLACE}}...")
 
+    socket_open("{{SERVER_IP_REPLACE}}", {{REVERSE_PORT_REPLACE}}, "reverse_socket")
+    socket_open("{{SERVER_IP_REPLACE}}", {{TRAJECTORY_SERVER_PORT_REPLACE}}, "trajectory_socket")
+    socket_open("{{SERVER_IP_REPLACE}}", {{SCRIPT_COMMAND_PORT_REPLACE}}, "script_command_socket")
 
-# NODE_CONTROL_LOOP_BEGINS
-textmsg("Reverse connection {{SERVER_IP_REPLACE}}:{{REVERSE_PORT_REPLACE}}...")
-textmsg("Trajectory connection {{SERVER_IP_REPLACE}}:{{TRAJECTORY_SERVER_PORT_REPLACE}}...")
-textmsg("Script command connection {{SERVER_IP_REPLACE}}:{{SCRIPT_COMMAND_PORT_REPLACE}}...")
+def initializeControlState():
+    global control_mode, steptime, read_timeout
+    global cmd_speedl_tool_speed, cmd_speed_joint, cmd_servo_joints, servo_start_check_pending
+    global trajectory_point_num, trajectory_result, trajectory_point_wait, trajectory_active
+    global freedrive_active, script_command_thread_handle, move_thread_handle, trajectory_thread_handle
+    cmd_speedl_tool_speed = [0, 0, 0, 0, 0, 0]
+    cmd_speed_joint = [0, 0, 0, 0, 0, 0]
+    control_mode = MODE_UNINITIALIZED
+    steptime = get_steptime()
+    trajectory_point_num = 0
+    cmd_servo_joints = get_actual_joint_positions()
+    servo_start_check_pending = False
+    trajectory_result = TRAJECTORY_RESULT_SUCCESS
+    trajectory_point_wait = 0.0
+    trajectory_active = False
+    freedrive_active = False
+    script_command_thread_handle = start_thread(scriptCommands, ())
+    move_thread_handle = 0
+    trajectory_thread_handle = 0
+    read_timeout = 0.0 # First read is blocking
 
-socket_open("{{SERVER_IP_REPLACE}}", {{REVERSE_PORT_REPLACE}}, "reverse_socket")
-socket_open("{{SERVER_IP_REPLACE}}", {{TRAJECTORY_SERVER_PORT_REPLACE}}, "trajectory_socket")
-socket_open("{{SERVER_IP_REPLACE}}", {{SCRIPT_COMMAND_PORT_REPLACE}}, "script_command_socket")
-
-# Global variate init
-cmd_speedl_tool_speed = [0, 0, 0, 0, 0, 0]
-cmd_speed_joint = [0, 0, 0, 0, 0, 0]
-control_mode = MODE_UNINITIALIZED
-steptime = get_steptime()
-trajectory_point_num = 0
-cmd_servo_joints = get_actual_joint_positions()
-script_command_thread_handle = start_thread(scriptCommands, ())
-move_thread_handle = 0
-trajectory_thread_handle = 0
-read_timeout = 0.0 # First read is blocking
-
-while control_mode > MODE_STOPPED:
+def readReverseCommand():
+    global read_timeout
     # First byte of response is return value of the read itself.
     # This offsets the byte indexing by 1 from what the driver sends.
     params_mult = socket_read_binary_integer(REVERSE_DATA_SIZE, "reverse_socket", read_timeout)
     if params_mult[0] > 0:
         # Convert to read timeout from milliseconds to seconds
         read_timeout = params_mult[1] / 1000.0
+    return params_mult
 
+def handleControlModeSwitch(new_mode):
+    global control_mode, move_thread_handle, freedrive_active
+    global cmd_servo_joints, servo_start_check_pending, cmd_speedl_tool_speed, cmd_speed_joint
+    # Stop the outgoing mode
+    if control_mode == MODE_TRAJECTORY:
+        cancelTrajectory()
+    elif control_mode == MODE_FREEDRIVE:
+        # FREEDRIVE_END may have ended freedrive already
+        if freedrive_active:
+            textmsg("End freedrive mode")
+            end_freedrive_mode()
+            freedrive_active = False
+    else:
+        stop_thread(move_thread_handle)
+        move_thread_handle = 0
+        stopj(STOPJ_ACCELERATION)
+
+    control_mode = new_mode
+
+    # Start new motion mode. MODE_TRAJECTORY needs nothing here, because its
+    # thread starts on TRAJECTORY_ACTION_START. Each velocity session starts at
+    # rest rather than at the last session's command.
+    if control_mode == MODE_SPEEDL:
+        cmd_speedl_tool_speed = [0, 0, 0, 0, 0, 0]
+        move_thread_handle = start_thread(speedlThread, ())
+    elif control_mode == MODE_SPEEDJ:
+        cmd_speed_joint = [0, 0, 0, 0, 0, 0]
+        move_thread_handle = start_thread(speedjThread, ())
+    elif control_mode == MODE_SERVOJ:
+        cmd_servo_joints = get_actual_joint_positions()
+        servo_start_check_pending = True
+        move_thread_handle = start_thread(servoThread, ())
+
+    # Log when a script stop is commanded externally
+    elif control_mode == MODE_STOPPED:
+        textmsg("ExternalControl: Script stopped")
+
+def applyModeCommand(params_mult):
+    global trajectory_thread_handle, trajectory_point_num, trajectory_active
+    global freedrive_active, servo_start_check_pending
+    # Update the motion commands with new parameters
+    if control_mode == MODE_SERVOJ:
+        joints = decodeVector6(params_mult, 2, POS_ZOOM_RATIO)
+        # Only a session's first target is vetted. A refused target never
+        # reaches cmd_servo_joints, so the arm keeps holding.
+        if servo_start_check_pending:
+            if verifyServoStartSetpoint(joints):
+                servo_start_check_pending = False
+                setServoSetpoint(joints)
+        else:
+            setServoSetpoint(joints)
+    elif control_mode == MODE_SPEEDL:
+        setSpeedl(decodeVector6(params_mult, 2, POS_ZOOM_RATIO))
+    elif control_mode == MODE_SPEEDJ:
+        setSpeedj(decodeVector6(params_mult, 2, POS_ZOOM_RATIO))
+    elif control_mode == MODE_TRAJECTORY:
+        if params_mult[2] == TRAJECTORY_ACTION_START:
+            # A trajectory still running is replaced without a result of its own,
+            # as upstream does. A CANCELED here could be read as the new one's result.
+            stop_thread(trajectory_thread_handle)
+            trajectory_thread_handle = 0
+            trajectoryClearPoints()
+            trajectory_point_num = params_mult[3]
+            trajectory_active = True
+            trajectory_thread_handle = start_thread(trajectoryThread, ())
+        elif params_mult[2] == TRAJECTORY_ACTION_CANCEL:
+            textmsg("Trajectory cancel received")
+            cancelTrajectory()
+    elif control_mode == MODE_FREEDRIVE:
+        if params_mult[2] == FREEDRIVE_START:
+            textmsg("Start freedrive mode")
+            freedrive_mode()
+            freedrive_active = True
+        elif params_mult[2] == FREEDRIVE_END:
+            textmsg("End freedrive mode")
+            end_freedrive_mode()
+            freedrive_active = False
+
+def runControlLoopIteration():
+    global control_mode
+    params_mult = readReverseCommand()
+    if params_mult[0] > 0:
         # Update new motion mode
         if control_mode != params_mult[REVERSE_DATA_SIZE]:
-            # Clear remaining trajectory points
-            if control_mode == MODE_TRAJECTORY:
-                stop_thread(trajectory_thread_handle)
-                trajectory_thread_handle = 0
-                stopj(STOPJ_ACCELERATION)
-                trajectoryClearPoints()
-                socket_send_int(TRAJECTORY_RESULT_CANCELED, "trajectory_socket")
-            elif control_mode == MODE_FREEDRIVE:
-                textmsg("End freedrive mode")
-                end_freedrive_mode()
-            else:
-                stop_thread(move_thread_handle)
-                move_thread_handle = 0
-                stopj(STOPJ_ACCELERATION)
-
-            control_mode = params_mult[REVERSE_DATA_SIZE]
-            
-            # Start new motion mode
-            if control_mode == MODE_SPEEDL:
-                move_thread_handle = start_thread(speedlThread, ())
-            elif control_mode == MODE_TRAJECTORY:
-                stop_thread(move_thread_handle)
-                move_thread_handle = 0
-                stopj(STOPJ_ACCELERATION)
-            elif control_mode == MODE_SPEEDJ:
-                move_thread_handle = start_thread(speedjThread, ())
-            elif control_mode == MODE_SERVOJ:
-                cmd_servo_joints = get_actual_joint_positions()
-                move_thread_handle = start_thread(servoThread, ())
-            
-            # Log when a script stop is commanded externally
-            elif control_mode == MODE_STOPPED:
-                textmsg("ExternalControl: Script stopped")
-            
-        # Update the motion commands with new parameters
-        if control_mode == MODE_SERVOJ:
-            joints = [params_mult[2]/ POS_ZOOM_RATIO, params_mult[3]/ POS_ZOOM_RATIO, params_mult[4]/ POS_ZOOM_RATIO, params_mult[5]/ POS_ZOOM_RATIO, params_mult[6]/ POS_ZOOM_RATIO, params_mult[7]/ POS_ZOOM_RATIO]
-            setServoSetpoint(joints)
-        elif control_mode == MODE_SPEEDL:
-            setSpeedl([params_mult[2] / POS_ZOOM_RATIO, params_mult[3] / POS_ZOOM_RATIO, params_mult[4] / POS_ZOOM_RATIO, params_mult[5] / POS_ZOOM_RATIO, params_mult[6] / POS_ZOOM_RATIO, params_mult[7] / POS_ZOOM_RATIO])
-        elif control_mode == MODE_SPEEDJ:
-            setSpeedj([params_mult[2] / POS_ZOOM_RATIO, params_mult[3] / POS_ZOOM_RATIO, params_mult[4] / POS_ZOOM_RATIO, params_mult[5] / POS_ZOOM_RATIO, params_mult[6] / POS_ZOOM_RATIO, params_mult[7] / POS_ZOOM_RATIO])
-        elif control_mode == MODE_TRAJECTORY:
-            if params_mult[2] == TRAJECTORY_ACTION_START:
-                stop_thread(trajectory_thread_handle)
-                trajectory_thread_handle = 0
-                trajectoryClearPoints()
-                trajectory_point_num = params_mult[3]
-                trajectory_thread_handle = start_thread(trajectoryThread, ())
-            elif params_mult[2] == TRAJECTORY_ACTION_CANCEL:
-                textmsg("Trajectory cancel received")
-                stop_thread(trajectory_thread_handle)
-                trajectory_thread_handle = 0
-                trajectoryClearPoints()
-                stopj(STOPJ_ACCELERATION)
-                socket_send_int(TRAJECTORY_RESULT_CANCELED, "trajectory_socket")
-        elif control_mode == MODE_FREEDRIVE:
-            if params_mult[2] == FREEDRIVE_START:
-                textmsg("Start freedrive mode")
-                freedrive_mode()
-            elif params_mult[2] == FREEDRIVE_END:
-                textmsg("End freedrive mode")
-                end_freedrive_mode()
+            handleControlModeSwitch(params_mult[REVERSE_DATA_SIZE])
+        applyModeCommand(params_mult)
     else:
         textmsg("Socket timed out waiting for command on reverse_socket. The script will exit now.")
         control_mode = MODE_STOPPED
 
-stop_thread(script_command_thread_handle)
-join_thread(script_command_thread_handle)
-stop_thread(move_thread_handle)
-join_thread(move_thread_handle)
-stop_thread(trajectory_thread_handle)
-join_thread(trajectory_thread_handle)
-stopj(STOPJ_ACCELERATION)
-textmsg("ExternalControl: All threads ended")
-socket_close("reverse_socket")
-socket_close("trajectory_socket")
-socket_close("script_command_socket")
+def shutdownControlThreads():
+    stop_thread(script_command_thread_handle)
+    join_thread(script_command_thread_handle)
+    stop_thread(move_thread_handle)
+    join_thread(move_thread_handle)
+    stop_thread(trajectory_thread_handle)
+    join_thread(trajectory_thread_handle)
+    stopj(STOPJ_ACCELERATION)
+    textmsg("ExternalControl: All threads ended")
+    socket_close("reverse_socket")
+    socket_close("trajectory_socket")
+    socket_close("script_command_socket")
+
+# HEADER_END
+
+
+# NODE_CONTROL_LOOP_BEGINS
+openControlSockets()
+initializeControlState()
+
+while control_mode > MODE_STOPPED:
+    runControlLoopIteration()
+
+shutdownControlThreads()
 
 # NODE_CONTROL_LOOP_ENDS

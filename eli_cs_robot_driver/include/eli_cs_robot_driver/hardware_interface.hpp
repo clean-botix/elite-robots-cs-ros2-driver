@@ -106,6 +106,14 @@ protected:
     std::chrono::steady_clock::time_point reconnect_start_time_;
     std::chrono::steady_clock::time_point reconnect_last_attempt_time_{};
     std::atomic<bool> rtsi_reconnecting_{ false };
+    // Set by async_thread_ whenever the external control script is resent, by the resend
+    // command or by reconnectAll(). write() (realtime thread) consumes it and performs the
+    // actual position_commands_/velocity_commands_ reset itself, so the reset — like every
+    // other write to those members — only ever happens on the realtime thread.
+    std::atomic<bool> command_reset_pending_{ false };
+    // True when this cycle's read() received a fresh RTSI frame. write() consumes
+    // command_reset_pending_ only then, so a reset never uses a pose from before a dropout.
+    bool joint_positions_fresh_{ false };
     // Standard throttle interval (s) for all repeated log messages. One log per this many
     // seconds prevents flooding during extended connection outages or write failures.
     static constexpr double kLogThrottleSeconds = 10.0;
@@ -205,6 +213,11 @@ protected:
     std::array<double, STANARD_ANALOG_IO_NUM> standard_analog_output_cmd_;
     std::array<double, STANARD_ANALOG_IO_NUM> standard_analog_output_types_cmd_;
     double tool_voltage_cmd_;
+    // The tool_voltage hardware parameter. -1 means none, or an unsupported value.
+    int configured_tool_voltage_{ -1 };
+    // Set by read() each time the task starts. Cleared by updateAsyncIO() once the
+    // script accepts the configured voltage.
+    std::atomic<bool> tool_voltage_apply_pending_{ false };
     double zero_ftsensor_cmd_;
     double zero_ftsensor_async_success_;
 
@@ -227,6 +240,7 @@ protected:
     geometry_msgs::msg::TransformStamped tcp_transform_;
 
     bool timeoutExpired(std::chrono::time_point<std::chrono::steady_clock>, int);
+    void resetCommandsToActualPose();
     void asyncThread();
     void updateAsyncIO();
     bool reconnectAll();

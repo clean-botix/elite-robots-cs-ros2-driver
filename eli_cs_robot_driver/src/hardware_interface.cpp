@@ -333,6 +333,7 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
     rtsi_reconnecting_.store(false);
     reconnection_needed_.store(false);
     reconnect_failed_.store(false);
+    command_reset_pending_.store(false);
     rtsi_interface_.reset();
     rtsi_out_recipe_.reset();
     rtsi_in_recipe_.reset();
@@ -383,6 +384,20 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
     // Time of servoj run
     const double servoj_time = stod(info_.hardware_parameters["servoj_time"]);
 
+    // Tool voltage applied each time the task starts. Only ToolVoltage values qualify.
+    configured_tool_voltage_ = -1;
+    if (info_.hardware_parameters.count("tool_voltage")) {
+        const int tool_voltage = stoi(info_.hardware_parameters["tool_voltage"]);
+        if (tool_voltage == static_cast<int>(ELITE::ToolVoltage::OFF) ||
+            tool_voltage == static_cast<int>(ELITE::ToolVoltage::V_12) ||
+            tool_voltage == static_cast<int>(ELITE::ToolVoltage::V_24)) {
+            configured_tool_voltage_ = tool_voltage;
+        } else {
+            RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "tool_voltage=%d is not 0, 12, or 24 — it will not be applied", tool_voltage);
+        }
+    }
+
     // const bool use_tool_communication = (info_.hardware_parameters["use_tool_communication"] == "true") ||
     //                                     (info_.hardware_parameters["use_tool_communication"] == "True");
 
@@ -426,6 +441,28 @@ hardware_interface::CallbackReturn EliteCSPositionHardwareInterface::on_configur
         driver_config.servoj_time = servoj_time;
         driver_config.servoj_lookahead_time = servoj_lookahead_time;
         driver_config.servoj_gain = servoj_gain;
+        // These script limits are optional. An absent parameter keeps the SDK default. So
+        // does a value that isn't positive, because it would refuse every servo session,
+        // every payload, or every trajectory.
+        auto read_positive_limit = [this](const std::string& name, float& field) {
+            if (!info_.hardware_parameters.count(name)) {
+                return;
+            }
+            const double value = stod(info_.hardware_parameters[name]);
+            if (value > 0.0) {
+                field = static_cast<float>(value);
+            } else {
+                RCLCPP_WARN(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                    "%s=%f is not positive — keeping the default %f", name.c_str(), value, field);
+            }
+        };
+        read_positive_limit("servoj_start_delta_limit_rad", driver_config.servoj_start_delta_limit_rad);
+        read_positive_limit("payload_mass_max_kg", driver_config.payload_mass_max_kg);
+        read_positive_limit("trajectory_point_timeout_s", driver_config.trajectory_point_timeout_s);
+        RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+            "Script limits: servoj_start_delta_limit_rad=%.4f, payload_mass_max_kg=%.2f, trajectory_point_timeout_s=%.2f",
+            driver_config.servoj_start_delta_limit_rad, driver_config.payload_mass_max_kg,
+            driver_config.trajectory_point_timeout_s);
 
         eli_driver_ = std::make_unique<ELITE::EliteDriver>(driver_config);
 
@@ -527,6 +564,13 @@ bool EliteCSPositionHardwareInterface::timeoutExpired(std::chrono::time_point<st
     auto current_time = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_time).count();
     return (elapsed >= timeout_s);
+}
+
+// Realtime-thread-only: callers must already be on the same thread as read()/write()/
+// perform_command_mode_switch(), which are the only other writers of these members.
+void EliteCSPositionHardwareInterface::resetCommandsToActualPose() {
+    position_commands_ = joint_positions_;
+    velocity_commands_ = {{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
 }
 
 std::vector<std::string> EliteCSPositionHardwareInterface::readRecipe(const std::string& recipe_file) {
@@ -673,6 +717,11 @@ bool EliteCSPositionHardwareInterface::reconnectAll() {
                 reconnect_log_time_ = now;
             }
         } else {
+            // In headless mode connect() resent the external control script, so the
+            // command buffers may hold a pre-interruption target. Reset them as the
+            // resend path does. write() applies the reset on the first cycle with a fresh
+            // RTSI frame, well before the script connects back and takes a servoj target.
+            command_reset_pending_.store(true);
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                 "reconnectAll: EliteDriver control channel reconnected");
         }
@@ -739,6 +788,7 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
     (void)period;
     (void)time;
     bool recv_ok = false;
+    joint_positions_fresh_ = false;
     if (!rtsi_reconnecting_.load() && rtsi_interface_) {
         try {
             recv_ok = rtsi_interface_->receiveData(rtsi_out_recipe_, true);
@@ -802,6 +852,7 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
         reconnect_failed_.store(false);
     }
     rtsi_out_recipe_->getValue("actual_joint_positions", joint_positions_);
+    joint_positions_fresh_ = true;
     rtsi_out_recipe_->getValue("actual_joint_speeds", joint_velocities_);
     rtsi_out_recipe_->getValue("actual_joint_current", joint_efforts_);
     rtsi_out_recipe_->getValue("speed_scaling", speed_scaling_combined_);
@@ -896,6 +947,10 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
                 "EliteScript task is now EXECUTING");
         }
+        // Every task start, the first included, gets the configured tool voltage.
+        if (runtime_state_ == ELITE::TaskStatus::PLAYING && configured_tool_voltage_ >= 0) {
+            tool_voltage_apply_pending_.store(true);
+        }
         prev_runtime_state_ = runtime_state_;
     }
 
@@ -961,8 +1016,7 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
         }
         rtsi_out_recipe_->getValue("actual_joint_positions", joint_positions_);
 
-        position_commands_ = joint_positions_;
-        velocity_commands_ = { { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 } };
+        resetCommandsToActualPose();
         target_speed_fraction_cmd_ = NO_NEW_CMD;
         resend_external_script_cmd_ = NO_NEW_CMD;
         zero_ftsensor_cmd_ = NO_NEW_CMD;
@@ -999,6 +1053,15 @@ hardware_interface::return_type EliteCSPositionHardwareInterface::read(const rcl
 hardware_interface::return_type EliteCSPositionHardwareInterface::write(const rclcpp::Time& time, const rclcpp::Duration& period) {
     (void)time;
     (void)period;
+    // async_thread_ flags a pending reset whenever it resends the external control script.
+    // Consume it here, on the realtime thread, so the actual write to position_commands_/
+    // velocity_commands_ never races with this function's own read of them a few lines
+    // below. The reset waits for a cycle whose read() got a fresh RTSI frame, so it never
+    // holds a pose from before an RTSI dropout. The script needs about a second to connect
+    // back, so waiting a cycle or two delays nothing.
+    if (joint_positions_fresh_ && command_reset_pending_.exchange(false)) {
+        resetCommandsToActualPose();
+    }
     // If there is no interpreting task running on the robot, we do not want to send anything.
     try {
         if (runtime_state_ == ELITE::TaskStatus::PLAYING && is_robot_connected_) {
@@ -1269,6 +1332,18 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
         }
     }
 
+    // Apply the configured tool voltage after each task start. setToolVoltage() fails
+    // until the script connects its command socket, so this retries every cycle until
+    // it lands. It runs before updateToolVoltage(), so a same-cycle command still wins.
+    if (tool_voltage_apply_pending_.load() && eli_driver_ != nullptr &&
+        runtime_state_ == ELITE::TaskStatus::PLAYING) {
+        if (eli_driver_->setToolVoltage(static_cast<ELITE::ToolVoltage>(configured_tool_voltage_))) {
+            tool_voltage_apply_pending_.store(false);
+            RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
+                "Applied configured tool_voltage=%d V at task start", configured_tool_voltage_);
+        }
+    }
+
     bool is_io_update = false;
     io_async_success_ = updateStandardIO(&is_io_update) ? io_async_success_ : false;
     io_async_success_ = updateConfigIO(&is_io_update) ? io_async_success_ : false;
@@ -1313,6 +1388,15 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
                 }
                 std::this_thread::sleep_for(10ms);
             }
+            // A fault kills the external control script without clearing position_commands_/
+            // velocity_commands_. If the arm is freedriven to a new pose before the script is
+            // resent, write() would otherwise send the robot straight back to its stale,
+            // pre-fault target the instant the script reconnects. Flag the reset instead of
+            // performing it here directly: this runs on async_thread_, and position_commands_/
+            // velocity_commands_ are otherwise only ever touched from the realtime thread
+            // (read()/write()/perform_command_mode_switch()) — write() below clears this flag
+            // and does the actual reset itself, on that same thread.
+            command_reset_pending_.store(true);
             resend_external_script_async_success_ = eli_driver_->sendExternalControlScript();
             if (resend_external_script_async_success_) {
                 RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"),
@@ -1366,7 +1450,7 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
                 "freedrive_start requested but EliteScript task is not EXECUTING — skipping");
             freedrive_async_success_ = false;
         } else {
-            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_START, 0);
+            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_START, recv_timeout_ * 1000);
             freedrive_activated_ = true;
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Started freedrive mode");
         }
@@ -1382,7 +1466,7 @@ void EliteCSPositionHardwareInterface::updateAsyncIO() {
                 "freedrive_end requested but EliteScript task is not EXECUTING — skipping SDK call");
             freedrive_async_success_ = false;
         } else {
-            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_END, 0);
+            freedrive_async_success_ = eli_driver_->writeFreedrive(ELITE::FreedriveAction::FREEDRIVE_END, recv_timeout_ * 1000);
             RCLCPP_INFO(rclcpp::get_logger("EliteCSPositionHardwareInterface"), "Ended freedrive mode");
         }
         freedrive_end_cmd_ = NO_NEW_CMD;
